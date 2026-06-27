@@ -1,5 +1,8 @@
 # coding=utf-8
 # Copyright 2026 The HunYuan team.
+import logging
+
+logger = logging.getLogger(__name__)
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -19,6 +22,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
@@ -492,6 +496,18 @@ class HYV3ForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+
+        # DEBUG: log final hidden states on prefill to compare GPU vs NPU
+        if (get_tensor_model_parallel_rank() == 0
+                and forward_batch.forward_mode.is_extend()
+                and not get_is_capture_mode()):
+            hs = hidden_states.float()
+            last = hs[-1]  # last token position → predicts first generated token
+            logger.info(
+                "[DBG prefill] ntokens=%d last_norm=%.5f last_mean=%.6f last_std=%.6f",
+                hs.shape[0], last.norm().item(), last.mean().item(), last.std().item(),
+            )
+
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
