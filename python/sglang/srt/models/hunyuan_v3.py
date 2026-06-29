@@ -465,7 +465,7 @@ class HYV3Model(nn.Module):
             if (get_tensor_model_parallel_rank() == 0
                 and forward_batch.forward_mode.is_extend()
                 and not get_is_capture_mode()
-                    and (i % 8 == 7 or i == 0)):
+                    and (i % 8 == 7 or i < 8)):
                 hs = hidden_states.float()
                 last = hs[-1]
                 logger.info(
