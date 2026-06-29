@@ -32,6 +32,8 @@ from sglang.srt.layers.utils import MultiPlatformOp, copy_or_rebind_param
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_is_capture_mode,
+    get_tensor_model_parallel_rank,
     is_cpu,
     is_hip,
     is_npu,
@@ -626,7 +628,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 b2=getattr(layer, "w2_weight_bias", None),
             )
             _lid = getattr(layer, "layer_id", -1)
-            if _lid == 1:
+            if _lid == 1 and not get_is_capture_mode() and get_tensor_model_parallel_rank() == 0:
                 _moe_debug_native_dump(
                     layer,
                     dispatch_output.hidden_states,
@@ -771,7 +773,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         top_k = layer.top_k or topk_ids.shape[1]  # in case layer.top_k is not set
 
         _lid = getattr(layer, "layer_id", -1)
-        _dbg = _lid == 1
+        _dbg = _lid == 1 and not get_is_capture_mode() and get_tensor_model_parallel_rank() == 0
 
         hidden_states, expanded_row_idx, expert_tokens, _ = (
             torch.ops.npu.npu_moe_init_routing_v2(
