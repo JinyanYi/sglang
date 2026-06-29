@@ -99,8 +99,8 @@ class HYV3FeedForward(nn.Module):
                         self.layer_id, last.norm().item(), last.mean().item(), last.std().item(), last.sum().item())
             # dump 真实数据用于离线对比
             torch.save({"x": x.float().cpu(), "w": self.gate_up_proj.weight.float().cpu()},
-                       f"/tmp/gemm_in_L{self.layer_id}.pt")
-            logger.info("[DBG DUMP] saved /tmp/gemm_in_L%03d.pt (x shape=%s, w shape=%s)",
+                       f"gemm_in_L{self.layer_id}.pt")
+            logger.info("[DBG DUMP] saved gemm_in_L%03d.pt (x shape=%s, w shape=%s)",
                         self.layer_id, list(x.shape), list(self.gate_up_proj.weight.shape))
         gate_up, _ = self.gate_up_proj(x)
         if _dbg:
@@ -109,8 +109,8 @@ class HYV3FeedForward(nn.Module):
             logger.info("[DBG FFN_GATE_UP] L%03d norm=%.5f mean=%.6f std=%.6f sum=%.6f",
                         self.layer_id, last.norm().item(), last.mean().item(), last.std().item(), last.sum().item())
             torch.save({"gate_up": gate_up.float().cpu()},
-                       f"/tmp/gemm_out_L{self.layer_id}.pt")
-            logger.info("[DBG DUMP] saved /tmp/gemm_out_L%03d.pt (gate_up shape=%s)",
+                       f"gemm_out_L{self.layer_id}.pt")
+            logger.info("[DBG DUMP] saved gemm_out_L%03d.pt (gate_up shape=%s)",
                         self.layer_id, list(gate_up.shape))
         out = self.act_fn(gate_up)
         if _dbg:
