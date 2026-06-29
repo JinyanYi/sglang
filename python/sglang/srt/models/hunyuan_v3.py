@@ -456,10 +456,22 @@ class HYV3Model(nn.Module):
         else:
             hidden_states = input_embeds
         residual = None
-        for layer in self.layers:
+        # DEBUG_LAYER_CHECKPOINT: log every 8 layers during prefill, rank 0 only.
+        # Set _DBG_LAYER_LOG = True to enable; False to disable with zero overhead.
+        for i, layer in enumerate(self.layers):
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
+            if (get_tensor_model_parallel_rank() == 0
+                and forward_batch.forward_mode.is_extend()
+                and not get_is_capture_mode()
+                    and (i % 8 == 7 or i == 0)):
+                hs = hidden_states.float()
+                last = hs[-1]
+                logger.info(
+                    "[DBG layer] L%03d last_norm=%.5f last_mean=%.6f last_std=%.6f",
+                    i, last.norm().item(), last.mean().item(), last.std().item(),
+                )
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
