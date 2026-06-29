@@ -89,6 +89,14 @@ class HYV3FeedForward(nn.Module):
         _dbg = (hasattr(self, 'layer_id') and self.layer_id == 1
                 and get_tensor_model_parallel_rank() == 0
                 and not get_is_capture_mode())
+        if _dbg:
+            w = self.gate_up_proj.weight.float()
+            logger.info("[DBG FFN_W_GATE_UP] L%03d shape=%s norm=%.5f mean=%.6f std=%.6f sum=%.6f",
+                        self.layer_id, list(w.shape), w.norm().item(), w.mean().item(), w.std().item(), w.sum().item())
+            hs = x.float()
+            last = hs[-1]
+            logger.info("[DBG FFN_IN] L%03d norm=%.5f mean=%.6f std=%.6f sum=%.6f",
+                        self.layer_id, last.norm().item(), last.mean().item(), last.std().item(), last.sum().item())
         gate_up, _ = self.gate_up_proj(x)
         if _dbg:
             hs = gate_up.float()
