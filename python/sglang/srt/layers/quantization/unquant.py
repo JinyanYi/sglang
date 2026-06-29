@@ -32,8 +32,6 @@ from sglang.srt.layers.utils import MultiPlatformOp, copy_or_rebind_param
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
-    get_is_capture_mode,
-    get_tensor_model_parallel_rank,
     is_cpu,
     is_hip,
     is_npu,
@@ -186,9 +184,9 @@ def _moe_debug_native_dump(
         if num_tok == 0:
             start_idx = end_idx
             continue
-        tok = sorted_tokens[start_idx:end_idx].float()
-        w13 = layer.w13_weight[i].float()
-        w2 = layer.w2_weight[i].float()
+        tok = sorted_tokens[start_idx:end_idx]
+        w13 = layer.w13_weight[i]
+        w2 = layer.w2_weight[i]
 
         gate_up = F.linear(tok, w13)
         gate, up = gate_up.chunk(2, dim=-1)
@@ -229,7 +227,7 @@ def _moe_debug_native_dump(
         )
         torch.save(
             {
-                "dispatched_x": sorted_tokens.float().cpu(),
+                "dispatched_x": sorted_tokens.cpu(),
                 "topk_ids": topk_ids.cpu(),
                 "topk_weights": topk_weights.float().cpu(),
                 "gmm1_out": cat_gmm1.cpu(),
@@ -628,6 +626,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 b2=getattr(layer, "w2_weight_bias", None),
             )
             _lid = getattr(layer, "layer_id", -1)
+            from sglang.srt.model_executor.runner import get_is_capture_mode
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+
             if _lid == 1 and not get_is_capture_mode() and get_tensor_model_parallel_rank() == 0:
                 _moe_debug_native_dump(
                     layer,
@@ -773,6 +774,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         top_k = layer.top_k or topk_ids.shape[1]  # in case layer.top_k is not set
 
         _lid = getattr(layer, "layer_id", -1)
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
         _dbg = _lid == 1 and not get_is_capture_mode() and get_tensor_model_parallel_rank() == 0
 
         hidden_states, expanded_row_idx, expert_tokens, _ = (
