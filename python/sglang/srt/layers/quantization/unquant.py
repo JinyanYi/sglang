@@ -155,6 +155,90 @@ class UnquantizedLinearMethod(LinearMethodBase):
         return F.linear(x, layer.weight, bias)
 
 
+def _moe_debug_native_dump(
+    layer: "torch.nn.Module",
+    x: "torch.Tensor",
+    topk_output: tuple,
+    lid: int,
+) -> None:
+    """
+    Debug helper (GPU only): run a pure-Python expert loop, dump per-expert
+    intermediate values (gate_up → act → down) and aggregate stats to disk.
+    Results are saved as gpu_expert_*_L<lid>.pt in the working directory.
+    This function does NOT affect the actual forward pass output.
+    """
+    topk_weights, topk_ids, _ = topk_output
+    num_experts = layer.num_experts
+
+    cnts = topk_ids.new_zeros((topk_ids.shape[0], num_experts))
+    cnts.scatter_(1, topk_ids.to(torch.int64), 1)
+    tokens_per_expert = cnts.sum(dim=0)
+    idxs = topk_ids.view(-1).argsort()
+    sorted_tokens = x[idxs // topk_ids.shape[1]]
+    tpe_np = tokens_per_expert.cpu().numpy()
+
+    all_gmm1, all_act, all_gmm2 = [], [], []
+    start_idx = 0
+    for i, num_tok in enumerate(tpe_np):
+        end_idx = start_idx + num_tok
+        if num_tok == 0:
+            start_idx = end_idx
+            continue
+        tok = sorted_tokens[start_idx:end_idx].float()
+        w13 = layer.w13_weight[i].float()
+        w2 = layer.w2_weight[i].float()
+
+        gate_up = F.linear(tok, w13)
+        gate, up = gate_up.chunk(2, dim=-1)
+        act_out = F.silu(gate) * up
+        down_out = F.linear(act_out, w2)
+
+        all_gmm1.append(gate_up)
+        all_act.append(act_out)
+        all_gmm2.append(down_out)
+
+        logger.info(
+            "[DBG GPU EXPERT] L%03d E%03d ntok=%d "
+            "gate_up norm=%.5f mean=%.6f std=%.6f  "
+            "act norm=%.5f mean=%.6f std=%.6f  "
+            "down norm=%.5f mean=%.6f std=%.6f",
+            lid, i, num_tok,
+            gate_up.norm().item(), gate_up.mean().item(), gate_up.std().item(),
+            act_out.norm().item(), act_out.mean().item(), act_out.std().item(),
+            down_out.norm().item(), down_out.mean().item(), down_out.std().item(),
+        )
+        start_idx = end_idx
+
+    if all_gmm1:
+        cat_gmm1 = torch.cat(all_gmm1, dim=0)
+        cat_act = torch.cat(all_act, dim=0)
+        cat_gmm2 = torch.cat(all_gmm2, dim=0)
+        logger.info(
+            "[DBG GPU EXPERT] L%03d ALL gmm1(gate_up) norm=%.5f mean=%.6f std=%.6f sum=%.6f",
+            lid, cat_gmm1.norm().item(), cat_gmm1.mean().item(), cat_gmm1.std().item(), cat_gmm1.sum().item(),
+        )
+        logger.info(
+            "[DBG GPU EXPERT] L%03d ALL act norm=%.5f mean=%.6f std=%.6f sum=%.6f",
+            lid, cat_act.norm().item(), cat_act.mean().item(), cat_act.std().item(), cat_act.sum().item(),
+        )
+        logger.info(
+            "[DBG GPU EXPERT] L%03d ALL gmm2(down) norm=%.5f mean=%.6f std=%.6f sum=%.6f",
+            lid, cat_gmm2.norm().item(), cat_gmm2.mean().item(), cat_gmm2.std().item(), cat_gmm2.sum().item(),
+        )
+        torch.save(
+            {
+                "dispatched_x": sorted_tokens.float().cpu(),
+                "topk_ids": topk_ids.cpu(),
+                "topk_weights": topk_weights.float().cpu(),
+                "gmm1_out": cat_gmm1.cpu(),
+                "act_out": cat_act.cpu(),
+                "gmm2_out": cat_gmm2.cpu(),
+            },
+            f"gpu_expert_dump_L{lid:03d}.pt",
+        )
+        logger.info("[DBG GPU EXPERT] L%03d saved gpu_expert_dump_L%03d.pt", lid, lid)
+
+
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     """MoE method without quantization."""
 
@@ -541,6 +625,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
             )
+            _lid = getattr(layer, "layer_id", -1)
+            if _lid == 1:
+                _moe_debug_native_dump(
+                    layer,
+                    dispatch_output.hidden_states,
+                    dispatch_output.topk_output,
+                    _lid,
+                )
             return self.runner.run(dispatch_output, quant_info)
 
     def forward_cpu(
@@ -678,6 +770,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         num_experts = layer.num_experts
         top_k = layer.top_k or topk_ids.shape[1]  # in case layer.top_k is not set
 
+        _lid = getattr(layer, "layer_id", -1)
+        _dbg = _lid == 1
+
         hidden_states, expanded_row_idx, expert_tokens, _ = (
             torch.ops.npu.npu_moe_init_routing_v2(
                 x,
@@ -691,6 +786,23 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
         )
         expert_tokens = expert_tokens.to(torch.int64)
+
+        if _dbg:
+            _t = hidden_states.float()
+            logger.info(
+                "[DBG NPU EXPERT] L%03d after_routing shape=%s norm=%.5f mean=%.6f std=%.6f sum=%.6f",
+                _lid, list(_t.shape), _t.norm().item(), _t.mean().item(), _t.std().item(), _t.sum().item(),
+            )
+            logger.info(
+                "[DBG NPU EXPERT] L%03d expert_tokens(cumsum)=%s",
+                _lid, expert_tokens.tolist(),
+            )
+            torch.save(
+                {"dispatched_x": _t.cpu(), "expert_tokens": expert_tokens.cpu(),
+                 "topk_ids": topk_ids.cpu(), "topk_weights": topk_weights.float().cpu()},
+                f"npu_expert_routing_L{_lid:03d}.pt",
+            )
+
         w13_bias = [layer.w13_weight_bias] if self.with_bias else None
         w2_bias = [layer.w2_weight_bias] if self.with_bias else None
 
@@ -705,6 +817,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             group_list=expert_tokens,
             output_dtype=original_dtype,
         )[0]
+
+        if _dbg:
+            _t = hidden_states.float()
+            logger.info(
+                "[DBG NPU EXPERT] L%03d after_gmm1(gate_up) shape=%s norm=%.5f mean=%.6f std=%.6f sum=%.6f",
+                _lid, list(_t.shape), _t.norm().item(), _t.mean().item(), _t.std().item(), _t.sum().item(),
+            )
+            torch.save({"gmm1_out": _t.cpu()}, f"npu_expert_gmm1_L{_lid:03d}.pt")
 
         # act_fn:
         if self.moe_runner_config.activation == "npu_swiglu_oai":
@@ -730,6 +850,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
             hidden_states = GeluAndMul()(hidden_states)
 
+        if _dbg:
+            _t = hidden_states.float()
+            logger.info(
+                "[DBG NPU EXPERT] L%03d after_swiglu(act) shape=%s norm=%.5f mean=%.6f std=%.6f sum=%.6f",
+                _lid, list(_t.shape), _t.norm().item(), _t.mean().item(), _t.std().item(), _t.sum().item(),
+            )
+            torch.save({"act_out": _t.cpu()}, f"npu_expert_act_L{_lid:03d}.pt")
+
         # gmm2: down_proj
         hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
@@ -742,6 +870,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             output_dtype=original_dtype,
         )[0]
 
+        if _dbg:
+            _t = hidden_states.float()
+            logger.info(
+                "[DBG NPU EXPERT] L%03d after_gmm2(down) shape=%s norm=%.5f mean=%.6f std=%.6f sum=%.6f",
+                _lid, list(_t.shape), _t.norm().item(), _t.mean().item(), _t.std().item(), _t.sum().item(),
+            )
+            torch.save({"gmm2_out": _t.cpu()}, f"npu_expert_gmm2_L{_lid:03d}.pt")
+
         final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
             hidden_states,
             skip1=None,
@@ -752,6 +888,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             export_for_source_row=topk_ids,
             drop_pad_mode=2,
         )
+
+        if _dbg:
+            _t = final_hidden_states.float()
+            logger.info(
+                "[DBG NPU EXPERT] L%03d after_finalize shape=%s norm=%.5f mean=%.6f std=%.6f sum=%.6f",
+                _lid, list(_t.shape), _t.norm().item(), _t.mean().item(), _t.std().item(), _t.sum().item(),
+            )
+            torch.save({"finalize_out": _t.cpu()}, f"npu_expert_finalize_L{_lid:03d}.pt")
 
         return StandardCombineInput(hidden_states=final_hidden_states)
 
