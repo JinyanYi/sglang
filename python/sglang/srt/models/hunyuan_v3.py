@@ -86,9 +86,27 @@ class HYV3FeedForward(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        _dbg = (hasattr(self, 'layer_id') and self.layer_id == 1
+                and get_tensor_model_parallel_rank() == 0
+                and not get_is_capture_mode())
         gate_up, _ = self.gate_up_proj(x)
+        if _dbg:
+            hs = gate_up.float()
+            last = hs[-1]
+            logger.info("[DBG FFN_GATE_UP] L%03d norm=%.5f mean=%.6f std=%.6f sum=%.6f",
+                        self.layer_id, last.norm().item(), last.mean().item(), last.std().item(), last.sum().item())
         out = self.act_fn(gate_up)
+        if _dbg:
+            hs = out.float()
+            last = hs[-1]
+            logger.info("[DBG FFN_ACT] L%03d norm=%.5f mean=%.6f std=%.6f sum=%.6f",
+                        self.layer_id, last.norm().item(), last.mean().item(), last.std().item(), last.sum().item())
         out, _ = self.down_proj(out)
+        if _dbg:
+            hs = out.float()
+            last = hs[-1]
+            logger.info("[DBG FFN_DOWN] L%03d norm=%.5f mean=%.6f std=%.6f sum=%.6f",
+                        self.layer_id, last.norm().item(), last.mean().item(), last.std().item(), last.sum().item())
         return out
 
 
@@ -147,6 +165,7 @@ class HYV3MoEFused(nn.Module):
                 prefix=f"{prefix}.shared_mlp",
                 reduce_results=False,
             )
+            self.shared_mlp.layer_id = layer_id
         else:
             self.shared_mlp = None
 
