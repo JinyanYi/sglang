@@ -182,12 +182,30 @@ class HYV3MoEFused(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
+        _dbg = (self.layer_id == 1
+                and get_tensor_model_parallel_rank() == 0
+                and not get_is_capture_mode())
+        if _dbg:
+            logger.info("[DBG ROUTER] L%03d logits_norm=%.5f logits_mean=%.6f logits_std=%.6f",
+                        self.layer_id, router_logits.norm().item(), router_logits.mean().item(), router_logits.std().item())
+
         topk_output = self.topk(hidden_states, router_logits)
+
         if self.shared_mlp is not None:
             shared_output = self.shared_mlp(hidden_states)
+            if _dbg:
+                hs = shared_output.float()
+                last = hs[-1]
+                logger.info("[DBG SHARED] L%03d norm=%.5f mean=%.6f std=%.6f",
+                            self.layer_id, last.norm().item(), last.mean().item(), last.std().item())
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, topk_output=topk_output
             )
+            if _dbg:
+                hs = final_hidden_states.float()
+                last = hs[-1]
+                logger.info("[DBG EXPERT] L%03d norm=%.5f mean=%.6f std=%.6f",
+                            self.layer_id, last.norm().item(), last.mean().item(), last.std().item())
             final_hidden_states = final_hidden_states + shared_output
         else:
             final_hidden_states = self.experts(
@@ -393,18 +411,40 @@ class HYV3DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        _dbg = (self.layer_id == 1
+                and get_tensor_model_parallel_rank() == 0
+                and forward_batch.forward_mode.is_extend()
+                and not get_is_capture_mode())
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        if _dbg:
+            hs = hidden_states.float()
+            last = hs[-1]
+            logger.info("[DBG LN_OUT] L%03d norm=%.5f mean=%.6f std=%.6f",
+                        self.layer_id, last.norm().item(), last.mean().item(), last.std().item())
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        if _dbg:
+            hs = hidden_states.float()
+            last = hs[-1]
+            logger.info("[DBG ATTN_OUT] L%03d norm=%.5f mean=%.6f std=%.6f",
+                        self.layer_id, last.norm().item(), last.mean().item(), last.std().item())
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if _dbg:
+            hs = hidden_states.float()
+            last = hs[-1]
+            logger.info("[DBG MoE_IN] L%03d norm=%.5f mean=%.6f std=%.6f",
+                        self.layer_id, last.norm().item(), last.mean().item(), last.std().item())
+
         hidden_states = self.mlp(hidden_states)
 
         return hidden_states, residual
