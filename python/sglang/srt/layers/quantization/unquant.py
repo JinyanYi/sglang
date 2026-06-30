@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
@@ -627,7 +628,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             _lid = getattr(layer, "layer_id", -1)
             from sglang.srt.model_executor.runner import get_is_capture_mode
-            from sglang.srt.distributed import get_tensor_model_parallel_rank
 
             if _lid == 1 and not get_is_capture_mode() and get_tensor_model_parallel_rank() == 0:
                 _moe_debug_native_dump(
@@ -775,7 +775,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         _lid = getattr(layer, "layer_id", -1)
         from sglang.srt.model_executor.runner import get_is_capture_mode
-        from sglang.srt.distributed import get_tensor_model_parallel_rank
 
         _dbg = _lid == 1 and not get_is_capture_mode() and get_tensor_model_parallel_rank() == 0
 
