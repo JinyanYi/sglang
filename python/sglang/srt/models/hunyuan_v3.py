@@ -86,9 +86,10 @@ class HYV3FeedForward(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        _dbg = (hasattr(self, 'layer_id') and self.layer_id == 1
-                and get_tensor_model_parallel_rank() == 0
-                and not get_is_capture_mode())
+        _dbg = False
+        # _dbg = (hasattr(self, 'layer_id') and self.layer_id == 1
+        #         and get_tensor_model_parallel_rank() == 0
+        #         and not get_is_capture_mode())
         if _dbg:
             w = self.gate_up_proj.weight.float()
             logger.info("[DBG FFN_W_GATE_UP] L%03d shape=%s norm=%.5f mean=%.6f std=%.6f sum=%.6f",
