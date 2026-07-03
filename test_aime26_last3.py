@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 # 与 accuracy_run.sh 一致
-URL = "http://127.0.0.1:9909/v1/chat/completions"
+URL = "http://127.0.0.1:9999/v1/chat/completions"
 MODEL = "/home/weights/Qwen3.6-35B-A3B"
 MAX_TOKENS = 131072
 TIMEOUT = 3600
