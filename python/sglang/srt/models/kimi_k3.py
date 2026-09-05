@@ -139,6 +139,12 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.utils import (
+        process_shared_expert,
+        wait_share_stream,
+    )
+
 
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
@@ -620,6 +626,7 @@ class KimiK3MoE(nn.Module):
         # MLP runs on the side stream.
         self._sbo_shared_overlap = (
             self._ep_a2a
+            and not self._shared_experts_attn_tp_comm
             and self.shared_experts is not None
             and self.alt_stream is not None
         )
@@ -1024,23 +1031,60 @@ class KimiK3MoE(nn.Module):
         hidden_states: torch.Tensor,
         *,
         prefix_sum: Optional[torch.Tensor],
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         """Front section with three separate GEMMs, each reading
         hidden_states: shared-expert MLP, router gate, latent down-proj."""
         # Shared experts on original hidden_states. Under SBO they go to the
         # side stream and are joined at the tail (see _sbo_shared_overlap).
         #
-        # CUDA issues this after the front so the shared experts overlap the
-        # routed a2a rather than the front GEMMs. NPU issues it before the front:
-        # this starts the attention-TP all-gather as soon as the post-attention
-        # RMSNorm output is available and lets the shared branch finish its
-        # lightweight DynamicQuant before the routed GroupedMatmul starts.
+        # Issued *after* the front, deliberately: alt_stream.wait_stream() makes
+        # the side stream wait for whatever the main stream has enqueued so far,
+        # so issuing here means the shared experts overlap the routed a2a rather
+        # than the front GEMMs. The shared branch is the shorter of the two and
+        # does not need a head start; running it against the front only takes
+        # bandwidth away from the critical path.
+        #
+        # On NPU, mirror GLM's DeepEP overlap: keep attention-TP collectives on
+        # the current stream, but run the shared MLP itself on share_stream.
+        # This avoids overlapping HCCL collectives while allowing shared
+        # compute to hide under routed dispatch / expert execution / combine.
         shared_output = None
         shared_event = None
+        npu_shared_gathered = None
+        npu_shared_input = None
+        enable_npu_dual_stream = (
+            _is_npu
+            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            and get_moe_a2a_backend().is_deepep()
+            and self.shared_experts is not None
+            and hidden_states.shape[0] > 0
+            and forward_batch is not None
+            and (
+                forward_batch.forward_mode.is_extend()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+        )
 
         def issue_shared():
-            nonlocal shared_output, shared_event
+            nonlocal shared_output, shared_event, npu_shared_gathered, npu_shared_input
             if self.shared_experts is None or hidden_states.shape[0] == 0:
+                return
+            if enable_npu_dual_stream:
+                if self._shared_experts_attn_tp_comm:
+                    group = get_parallel().attn_tp_group
+                    gathered_for_shared = get_local_dp_buffer(group)
+                    attn_tp_all_gather_into_tensor(
+                        gathered_for_shared, hidden_states
+                    )
+                    # The local-DP buffer is shared scratch storage. Give the
+                    # side stream stable input while the main stream proceeds.
+                    npu_shared_input = gathered_for_shared.clone()
+                else:
+                    npu_shared_input = hidden_states.clone()
+                npu_shared_gathered = process_shared_expert(
+                    npu_shared_input, self.shared_experts
+                )
                 return
             if self._sbo_shared_overlap:
                 current_stream = torch.cuda.current_stream()
@@ -1059,22 +1103,19 @@ class KimiK3MoE(nn.Module):
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
 
-        def wait_and_finalize_shared_experts():
+        def join_shared():
             nonlocal shared_output
-            if shared_event is None:
-                return
-            # Join as late as possible, then keep the attention-TP collective
-            # on the current stream before the shared output is consumed.
-            torch.cuda.current_stream().wait_event(shared_event)
-            if self._shared_experts_attn_tp_comm:
-                gathered_shared_output = shared_output
-                shared_output = torch.empty_like(hidden_states)
-                attn_tp_reduce_scatter_tensor(shared_output, gathered_shared_output)
-
-        # Give the NPU shared-expert branch a head start. At this point
-        # hidden_states is the decoder layer's post-attention RMSNorm output.
-        if _is_npu and self._sbo_shared_overlap:
-            issue_shared()
+            if npu_shared_gathered is not None:
+                wait_share_stream()
+                if self._shared_experts_attn_tp_comm:
+                    shared_output = torch.empty_like(hidden_states)
+                    attn_tp_reduce_scatter_tensor(
+                        shared_output, npu_shared_gathered
+                    )
+                else:
+                    shared_output = npu_shared_gathered
+            elif shared_event is not None:
+                torch.cuda.current_stream().wait_event(shared_event)
 
         # Front: gate + TopK (+ latent down-proj when the merged front covers it).
         # The gate and the latent down-proj read the same hidden_states, so the
@@ -1092,12 +1133,11 @@ class KimiK3MoE(nn.Module):
             # fp32 logits reach the radix router from moe_fused_gate.
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
-        if not (_is_npu and self._sbo_shared_overlap):
-            issue_shared()
+        issue_shared()
 
         if not self.use_latent_moe:
             expert_output = self.experts(hidden_states, topk_output)
-            wait_and_finalize_shared_experts()
+            join_shared()
             if shared_output is not None:
                 expert_output = expert_output + shared_output
             if self.tp_size > 1:
@@ -1136,7 +1176,10 @@ class KimiK3MoE(nn.Module):
             latent = self._reduce_latent(expert_output)
             # up_proj is replicated, so the routed output is now fully reduced.
             out, _ = self.routed_expert_up_proj(latent)
-        wait_and_finalize_shared_experts()
+        # Join as late as possible so the shared MLP can hide under the entire
+        # routed a2a + latent tail. NPU reduce-scatter starts only after this
+        # join and therefore remains ordered on the current stream.
+        join_shared()
         if shared_output is not None:
             # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
             # ones need the partial-sum reduction.
@@ -1401,7 +1444,11 @@ class KimiK3MoE(nn.Module):
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
-            out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
+            out = self._forward_unfused(
+                hidden_states,
+                prefix_sum=prefix_sum,
+                forward_batch=forward_batch,
+            )
         if use_dp:
             global_out = out
             out = get_local_dp_buffer(_dp_local_buffer_group())
