@@ -1,10 +1,56 @@
 """Context projection for K3 pipeline-parallel DSpark prefill."""
 
 from bisect import bisect_left
-from typing import Optional
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Iterator, Optional
 
 import torch
 import torch.nn.functional as F
+
+
+@dataclass(frozen=True)
+class DSparkPrefillLoadPlan:
+    """The draft parameters required by one PD-prefill PP stage."""
+
+    feature_slice: slice
+    num_context_features: int
+    load_kv_writer: bool
+
+    def __post_init__(self) -> None:
+        start, stop = self.feature_slice.start, self.feature_slice.stop
+        if (
+            start is None
+            or stop is None
+            or self.feature_slice.step not in (None, 1)
+            or not 0 <= start <= stop <= self.num_context_features
+        ):
+            raise ValueError("Invalid DSpark prefill context feature slice.")
+
+    @property
+    def local_num_features(self) -> int:
+        return self.feature_slice.stop - self.feature_slice.start
+
+
+_LOAD_PLAN: ContextVar[Optional[DSparkPrefillLoadPlan]] = ContextVar(
+    "dspark_prefill_load_plan", default=None
+)
+
+
+@contextmanager
+def dspark_prefill_load_scope(
+    plan: Optional[DSparkPrefillLoadPlan],
+) -> Iterator[None]:
+    token = _LOAD_PLAN.set(plan)
+    try:
+        yield
+    finally:
+        _LOAD_PLAN.reset(token)
+
+
+def get_dspark_prefill_load_plan() -> Optional[DSparkPrefillLoadPlan]:
+    return _LOAD_PLAN.get()
 
 
 def context_feature_slice(
@@ -42,8 +88,16 @@ def accumulate_context(
     width = (features.stop - features.start) * hidden_size
     if hidden is None or hidden.shape[0] < num_tokens or hidden.shape[1] != width:
         raise RuntimeError("Missing or incorrectly shaped local DSpark PP captures.")
+    if weight.shape[1] == width:
+        local_weight = weight
+    else:
+        local_weight = weight[
+            :, features.start * hidden_size : features.stop * hidden_size
+        ]
+        if local_weight.shape[1] != width:
+            raise RuntimeError("DSpark PP context projection has an unexpected width.")
     partial = F.linear(
         hidden[:num_tokens],
-        weight[:, features.start * hidden_size : features.stop * hidden_size],
+        local_weight,
     ).float()
     return partial if accumulated is None else accumulated + partial

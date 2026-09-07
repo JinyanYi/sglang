@@ -11,6 +11,7 @@ from collections import deque
 from contextlib import nullcontext
 from pathlib import Path
 from types import MethodType, SimpleNamespace
+from typing import Optional
 from unittest.mock import Mock
 
 import torch
@@ -18,8 +19,11 @@ import torch.nn.functional as F
 import numpy as np
 
 from sglang.srt.speculative.dspark_components.dspark_pp import (
+    DSparkPrefillLoadPlan,
     accumulate_context,
     context_feature_slice,
+    dspark_prefill_load_scope,
+    get_dspark_prefill_load_plan,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -84,9 +88,14 @@ class TestDSparkPPProjection(unittest.TestCase):
                         features.start * 32 : features.stop * 32,
                     ]
                     # DP padding is not part of the transferred prompt context.
-                    local = F.pad(local, (0, 0, 0, 2))
+                    if local.shape[1]:
+                        local = F.pad(local, (0, 0, 0, 2))
+                    local_weight = weight[
+                        :,
+                        features.start * 32 : features.stop * 32,
+                    ]
                     accumulated = accumulate_context(
-                        local, accumulated, weight, features, length
+                        local, accumulated, local_weight, features, length
                     )
                 self.assertEqual(accumulated.dtype, torch.float32)
                 chunks.append(accumulated)
@@ -111,6 +120,90 @@ class TestDSparkPPProjection(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 accumulate_context(hidden, acc, weight, features, 2)
         self.assertIsNone(accumulate_context(None, None, weight, slice(0, 0), 2))
+
+    def test_prefill_load_plan_scope_is_local_and_restored(self):
+        plan = DSparkPrefillLoadPlan(
+            feature_slice=slice(1, 3),
+            num_context_features=5,
+            load_kv_writer=False,
+        )
+        self.assertIsNone(get_dspark_prefill_load_plan())
+        with dspark_prefill_load_scope(plan):
+            self.assertIs(get_dspark_prefill_load_plan(), plan)
+            self.assertEqual(plan.local_num_features, 2)
+        self.assertIsNone(get_dspark_prefill_load_plan())
+
+    def test_sparse_weight_loading_slices_fc_and_fused_qkv(self):
+        methods = _methods(
+            "models/dflash.py",
+            "DFlashDraftModel",
+            ["load_weights"],
+            Optional=Optional,
+            default_weight_loader=lambda param, weight: param.data.copy_(weight),
+            _logical_linear_weight_shape=lambda *args, **kwargs: (),
+        )
+
+        fc = torch.nn.Parameter(torch.empty(4, 4))
+        fc.dspark_feature_slice = slice(1, 2)
+        qkv = torch.nn.Parameter(torch.empty(4, 3))
+        qkv.dspark_kv_only = True
+        qkv.checkpoint_q_size = 4
+        qkv.checkpoint_kv_size = 2
+        owner = SimpleNamespace(
+            is_nemotron_35_draft=False,
+            config=SimpleNamespace(hidden_size=4),
+            num_context_features=3,
+            named_parameters=lambda: [
+                ("fc.weight", fc),
+                ("layers.0.self_attn.qkv_proj.weight", qkv),
+            ],
+        )
+        full_fc = torch.arange(48, dtype=torch.float32).reshape(4, 12)
+        full_qkv = torch.arange(24, dtype=torch.float32).reshape(8, 3)
+        methods.load_weights(
+            owner,
+            [
+                ("fc.weight", full_fc),
+                ("layers.0.self_attn.qkv_proj.weight", full_qkv),
+            ],
+        )
+        torch.testing.assert_close(fc, full_fc[:, 4:8])
+        torch.testing.assert_close(qkv, full_qkv[4:8])
+
+    def test_sparse_weight_loading_skips_q_and_maps_split_kv(self):
+        methods = _methods(
+            "models/dflash.py",
+            "DFlashDraftModel",
+            ["load_weights"],
+            Optional=Optional,
+            default_weight_loader=lambda *args: None,
+            _logical_linear_weight_shape=lambda *args, **kwargs: (),
+        )
+        loaded = {}
+        qkv = torch.nn.Parameter(torch.empty(4, 3))
+        qkv.dspark_kv_only = True
+        qkv.weight_loader = lambda param, weight, shard: loaded.setdefault(
+            shard, weight.clone()
+        )
+        owner = SimpleNamespace(
+            is_nemotron_35_draft=False,
+            config=SimpleNamespace(hidden_size=4),
+            num_context_features=3,
+            named_parameters=lambda: [
+                ("layers.0.self_attn.qkv_proj.weight", qkv),
+            ],
+        )
+        methods.load_weights(
+            owner,
+            [
+                ("layers.0.self_attn.q_proj.weight", torch.full((4, 3), -1.0)),
+                ("layers.0.self_attn.k_proj.weight", torch.full((2, 3), 1.0)),
+                ("layers.0.self_attn.v_proj.weight", torch.full((2, 3), 2.0)),
+            ],
+        )
+        self.assertEqual(set(loaded), {0, 1})
+        torch.testing.assert_close(loaded[0], torch.ones(2, 3))
+        torch.testing.assert_close(loaded[1], torch.full((2, 3), 2.0))
 
     def test_k3_boundary_uses_next_stages_weights(self):
         for use_attn_res in (False, True):
@@ -274,6 +367,72 @@ class TestDSparkPPProjection(unittest.TestCase):
             )
             self.assertEqual(worker._accumulate_pp_context.call_count, 0 if idle else 1)
 
+    def test_last_stage_writes_projected_context_to_shared_cache_location(self):
+        events = []
+        projected = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        cache_loc = torch.tensor([11, 13], dtype=torch.int32)
+        output = SimpleNamespace(
+            logits_output=SimpleNamespace(hidden_states=torch.zeros_like(projected)),
+            next_token_ids=torch.tensor([5]),
+        )
+
+        class Injector:
+            def inject_target_hidden(self, **kwargs):
+                events.append(("inject", kwargs))
+
+        def accumulate(batch, batch_output, pp_proxy_tensors):
+            events.append(("accumulate", None))
+            batch_output.logits_output.hidden_states = projected
+
+        target = SimpleNamespace(
+            forward_batch_generation=lambda *args, **kwargs: (
+                events.append(("target", None)) or output
+            )
+        )
+        methods = _methods(
+            "speculative/dspark_components/dspark_worker_v2.py",
+            "DSparkWorkerV2",
+            ["_forward_prefill"],
+            get_parallel=lambda: SimpleNamespace(enable_dp_attention=False),
+            CaptureHiddenMode=SimpleNamespace(FULL="full"),
+            SpecTpSyncSite=SimpleNamespace(DSPARK_TARGET="target"),
+            is_pin_memory_available=lambda device: False,
+            compute_position=lambda backend, prefix, context, total: (
+                torch.arange(total),
+                None,
+            ),
+            is_unified_kv_triton=lambda: False,
+            make_next_draft_input=lambda **kwargs: kwargs,
+            torch=torch,
+        )
+        worker = SimpleNamespace(
+            _is_pp_prefill=True,
+            _context_only_pp_rank=False,
+            target_worker=target,
+            _accumulate_pp_context=accumulate,
+            _tp_sync=SimpleNamespace(sync=lambda *args: None),
+            model_runner=SimpleNamespace(prefill_attention_backend_str="torch"),
+            _kv_injector=Injector(),
+        )
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            extend_lens=[2],
+            prefix_lens=[3],
+            seq_lens=torch.tensor([5]),
+            out_cache_loc=cache_loc,
+        )
+        result = methods._forward_prefill(worker, batch, None, _Proxy({}))
+
+        self.assertIs(result, output)
+        self.assertEqual(
+            [event[0] for event in events], ["target", "accumulate", "inject"]
+        )
+        injected = events[-1][1]
+        self.assertIs(injected["target_hidden"], projected)
+        self.assertIs(injected["cache_loc"], cache_loc)
+        self.assertTrue(injected["target_hidden_is_projected"])
+        self.assertIsNone(output.logits_output.hidden_states)
+
     def test_dspark_ring_does_not_publish_eagle_fields(self):
         methods = _methods(
             "managers/scheduler_pp_mixin.py",
@@ -291,6 +450,25 @@ class TestDSparkPPProjection(unittest.TestCase):
             owner, result, SimpleNamespace(return_logprob=False)
         )
         self.assertEqual(list(output), ["next_token_ids"])
+
+    def test_only_last_prefill_stage_budgets_draft_kv(self):
+        parallel = SimpleNamespace(pp_size=2, pp_rank=0, attn_dcp_size=2)
+        methods = _methods(
+            "model_executor/pool_configurator.py",
+            None,
+            ["_has_dflash_draft_pool", "_dflash_draft_cell_size"],
+            get_parallel=lambda: parallel,
+            get_disagg=lambda: SimpleNamespace(disaggregation_mode="prefill"),
+            is_npu=lambda: True,
+        )
+        kvc = SimpleNamespace(
+            is_draft_worker=False,
+            spec_algorithm=SimpleNamespace(is_dflash_family=lambda: True),
+            spec_aux_config=SimpleNamespace(dflash_draft_cell_size_per_token=128),
+        )
+        self.assertEqual(methods._dflash_draft_cell_size(kvc), 0)
+        parallel.pp_rank = 1
+        self.assertEqual(methods._dflash_draft_cell_size(kvc), 256)
 
     def test_original_topology_contacts_matching_rank_on_both_pp_stages(self):
         methods = _methods(

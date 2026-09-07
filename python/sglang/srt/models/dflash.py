@@ -140,11 +140,17 @@ def _get_dflash_layer_attention_params(
 
 class DFlashAttention(nn.Module):
     def __init__(
-        self, config, layer_id: int, quant_config=None, prefix: str = ""
+        self,
+        config,
+        layer_id: int,
+        quant_config=None,
+        prefix: str = "",
+        kv_only: bool = False,
     ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
-        tp_size = int(get_parallel().tp_size)
+        parallel = get_parallel()
+        tp_size = int(parallel.tp_size)
         total_num_heads = int(config.num_attention_heads)
         total_num_kv_heads = int(
             getattr(config, "num_key_value_heads", total_num_heads)
@@ -171,31 +177,63 @@ class DFlashAttention(nn.Module):
             )
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = head_dim
-        self.q_size = self.num_heads * head_dim
+        self.kv_only = kv_only
+        self.checkpoint_q_size = self.total_num_heads * head_dim
+        self.checkpoint_kv_size = self.total_num_kv_heads * head_dim
+        self.q_size = 0 if kv_only else self.num_heads * head_dim
         self.kv_size = self.num_kv_heads * head_dim
 
         attention_bias = bool(getattr(config, "attention_bias", False))
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size=hidden_size,
-            head_size=head_dim,
-            total_num_heads=self.total_num_heads,
-            total_num_kv_heads=self.total_num_kv_heads,
-            bias=attention_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj" if prefix else "qkv_proj",
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * head_dim,
-            hidden_size,
-            bias=attention_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.o_proj" if prefix else "o_proj",
-        )
+        qkv_prefix = f"{prefix}.qkv_proj" if prefix else "qkv_proj"
+        if kv_only:
+            if quant_config is not None:
+                raise ValueError(
+                    "DSpark prefill KV-only loading requires unquantized draft weights."
+                )
+            kv_tp_size = min(tp_size, self.total_num_kv_heads)
+            kv_head_replicas = max(1, tp_size // self.total_num_kv_heads)
+            self.qkv_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [self.checkpoint_kv_size, self.checkpoint_kv_size],
+                bias=attention_bias,
+                quant_config=None,
+                prefix=qkv_prefix,
+                tp_rank=int(parallel.tp_rank) // kv_head_replicas,
+                tp_size=kv_tp_size,
+            )
+            for param in (self.qkv_proj.weight, self.qkv_proj.bias):
+                if param is not None:
+                    set_weight_attrs(
+                        param,
+                        {
+                            "dspark_kv_only": True,
+                            "checkpoint_q_size": self.checkpoint_q_size,
+                            "checkpoint_kv_size": self.checkpoint_kv_size,
+                        },
+                    )
+            self.o_proj = None
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size=hidden_size,
+                head_size=head_dim,
+                total_num_heads=self.total_num_heads,
+                total_num_kv_heads=self.total_num_kv_heads,
+                bias=attention_bias,
+                quant_config=quant_config,
+                prefix=qkv_prefix,
+            )
+            self.o_proj = RowParallelLinear(
+                self.total_num_heads * head_dim,
+                hidden_size,
+                bias=attention_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.o_proj" if prefix else "o_proj",
+            )
 
         # Per-head Q/K RMSNorm, matching HF Qwen3.
-        self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
+        self.q_norm = None if kv_only else RMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
 
         rope_theta, rope_scaling = get_rope_config(config)
@@ -279,6 +317,10 @@ class DFlashAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if self.kv_only:
+            raise RuntimeError(
+                "DSpark prefill KV-only attention cannot run draft forward."
+            )
         qkv, _ = self.qkv_proj(hidden_states)
         if _is_npu:
             q, k, v = self.forward_prepare_npu(positions, hidden_states)
@@ -324,6 +366,10 @@ class DFlashAttention(nn.Module):
         This is used by DFlash to materialize ctx tokens into the draft KV cache:
         we only need K/V for the cached tokens; Q is never consumed.
         """
+        if self.kv_only:
+            kv, _ = self.qkv_proj(hidden_states)
+            return kv.split([self.kv_size, self.kv_size], dim=-1)
+
         # Fast path for unquantized weights: slice the fused QKV weight and run one GEMM.
         can_slice_qkv_weight, _ = can_dflash_slice_qkv_weight(self.qkv_proj)
         if can_slice_qkv_weight:
@@ -541,6 +587,20 @@ class DFlashDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+class DFlashContextKVLayer(nn.Module):
+    """The subset of a draft layer needed to materialize prompt K/V."""
+
+    def __init__(self, config, layer_id: int, prefix: str = "") -> None:
+        super().__init__()
+        self.self_attn = DFlashAttention(
+            config=config,
+            layer_id=layer_id,
+            quant_config=None,
+            prefix=f"{prefix}.self_attn" if prefix else "self_attn",
+            kv_only=True,
+        )
+
+
 class DFlashDraftModel(nn.Module):
     """SGLang DFlash draft model with an optional Nemotron embedding.
 
@@ -556,6 +616,11 @@ class DFlashDraftModel(nn.Module):
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
         self.config = config
+        from sglang.srt.speculative.dspark_components.dspark_pp import (
+            get_dspark_prefill_load_plan,
+        )
+
+        prefill_plan = get_dspark_prefill_load_plan()
 
         hidden_size = int(config.hidden_size)
         num_layers = int(config.num_hidden_layers)
@@ -566,8 +631,14 @@ class DFlashDraftModel(nn.Module):
         self.block_size = draft_config.resolve_block_size(default=16)
         self.candidate_selector: Optional[nn.Module] = None
         self.is_nemotron_35_draft = is_nemotron_35_draft_config(config)
+        if prefill_plan is not None and (
+            self.is_nemotron_35_draft or quant_config is not None
+        ):
+            raise ValueError(
+                "DSpark prefill sparse loading only supports dense unquantized drafts."
+            )
         self.embed_tokens: Optional[VocabParallelEmbedding] = None
-        if self.is_nemotron_35_draft:
+        if self.is_nemotron_35_draft and prefill_plan is None:
             embed_prefix = f"{prefix}.embed_tokens" if prefix else "embed_tokens"
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -586,24 +657,40 @@ class DFlashDraftModel(nn.Module):
                 draft_config.conv_group_size,
             )
 
-        self.layers = nn.ModuleList(
-            [
-                self.decoder_layer_cls(
-                    config=config,
-                    layer_id=i,
-                    attention_conv=grouped_conv(),
-                    mlp_conv=grouped_conv(),
-                    quant_config=quant_config,
-                    prefix=(
-                        (f"{prefix}.layers.{i}" if prefix else f"layers.{i}")
-                        if self.is_nemotron_35_draft
-                        else ""
-                    ),
-                )
-                for i in range(num_layers)
-            ]
-        )
-        self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        if prefill_plan is None:
+            self.layers = nn.ModuleList(
+                [
+                    self.decoder_layer_cls(
+                        config=config,
+                        layer_id=i,
+                        attention_conv=grouped_conv(),
+                        mlp_conv=grouped_conv(),
+                        quant_config=quant_config,
+                        prefix=(
+                            (f"{prefix}.layers.{i}" if prefix else f"layers.{i}")
+                            if self.is_nemotron_35_draft
+                            else ""
+                        ),
+                    )
+                    for i in range(num_layers)
+                ]
+            )
+            self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        elif prefill_plan.load_kv_writer:
+            self.layers = nn.ModuleList(
+                [
+                    DFlashContextKVLayer(
+                        config=config,
+                        layer_id=i,
+                        prefix=f"{prefix}.layers.{i}" if prefix else f"layers.{i}",
+                    )
+                    for i in range(num_layers)
+                ]
+            )
+            self.norm = None
+        else:
+            self.layers = nn.ModuleList()
+            self.norm = None
 
         # Project per-token target context features:
         # concat(K * hidden_size) -> hidden_size, where K is the number of target-layer
@@ -620,6 +707,9 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
+        self._prefill_feature_slice = (
+            prefill_plan.feature_slice if prefill_plan is not None else None
+        )
         if self.is_nemotron_35_draft:
             fc_prefix = f"{prefix}.fc" if prefix else "fc"
             self.fc = ReplicatedLinear(
@@ -630,10 +720,22 @@ class DFlashDraftModel(nn.Module):
                 prefix=fc_prefix,
             )
         else:
-            self.fc = nn.Linear(
-                self.num_context_features * hidden_size, hidden_size, bias=False
+            fc_input_features = (
+                prefill_plan.local_num_features * hidden_size
+                if prefill_plan is not None
+                else self.num_context_features * hidden_size
             )
-        self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+            self.fc = nn.Linear(fc_input_features, hidden_size, bias=False)
+            if prefill_plan is not None:
+                set_weight_attrs(
+                    self.fc.weight,
+                    {"dspark_feature_slice": prefill_plan.feature_slice},
+                )
+        self.hidden_norm = (
+            RMSNorm(hidden_size, eps=rms_norm_eps)
+            if prefill_plan is None or prefill_plan.load_kv_writer
+            else None
+        )
 
     def set_block_size(self, block_size: int) -> None:
         """Adopt the block size the worker resolved.
@@ -644,7 +746,10 @@ class DFlashDraftModel(nn.Module):
         """
         self.block_size = int(block_size)
         for layer in self.layers:
-            for conv in (layer.attention_conv, layer.mlp_conv):
+            for conv in (
+                getattr(layer, "attention_conv", None),
+                getattr(layer, "mlp_conv", None),
+            ):
                 if conv is not None:
                     conv.block_size = self.block_size
 
@@ -688,6 +793,8 @@ class DFlashDraftModel(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
+        if self._prefill_feature_slice is not None:
+            raise RuntimeError("DSpark prefill sparse model cannot run draft forward.")
         if input_embeds is None:
             if self.embed_tokens is not None:
                 input_embeds = self.embed_tokens(input_ids)
@@ -760,6 +867,10 @@ class DFlashDraftModel(nn.Module):
                 if resolved_name is None:
                     continue
                 param = params_dict[resolved_name]
+                if getattr(param, "dspark_kv_only", False):
+                    if shard_id == "q":
+                        break
+                    shard_id = {"k": 0, "v": 1}[shard_id]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -769,7 +880,32 @@ class DFlashDraftModel(nn.Module):
                     # Ignore unexpected weights (e.g., HF rotary caches).
                     continue
                 param = params_dict[resolved_name]
+                if getattr(param, "dspark_kv_only", False):
+                    output_dim = getattr(param, "output_dim", 0)
+                    loaded_weight = loaded_weight.narrow(
+                        output_dim,
+                        int(param.checkpoint_q_size),
+                        2 * int(param.checkpoint_kv_size),
+                    )
                 if resolved_name.endswith("fc.weight"):
+                    feature_slice = getattr(param, "dspark_feature_slice", None)
+                    if feature_slice is not None:
+                        full_shape = (
+                            int(self.config.hidden_size),
+                            int(self.num_context_features * self.config.hidden_size),
+                        )
+                        if tuple(loaded_weight.shape) != full_shape:
+                            raise ValueError(
+                                "DSpark prefill fc.weight does not match the full "
+                                f"checkpoint shape: expected {full_shape}, got "
+                                f"{tuple(loaded_weight.shape)}."
+                            )
+                        hidden_size = int(self.config.hidden_size)
+                        loaded_weight = loaded_weight[
+                            :,
+                            feature_slice.start * hidden_size : feature_slice.stop
+                            * hidden_size,
+                        ].contiguous()
                     if self.is_nemotron_35_draft:
                         expected_shape = (
                             int(self.config.hidden_size),

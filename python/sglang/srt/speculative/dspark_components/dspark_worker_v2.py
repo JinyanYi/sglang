@@ -64,7 +64,11 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
 )
-from sglang.srt.speculative.dspark_components.dspark_pp import accumulate_context
+from sglang.srt.speculative.dspark_components.dspark_pp import (
+    DSparkPrefillLoadPlan,
+    accumulate_context,
+    dspark_prefill_load_scope,
+)
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
@@ -153,10 +157,29 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._is_pd_prefill = get_disagg().disaggregation_mode == "prefill"
         self._is_pp_prefill = self._is_pd_prefill and ps.pp_size > 1
         self._context_only_pp_rank = self._is_pp_prefill and ps.pp_rank < ps.pp_size - 1
+        self._prefill_load_plan = None
         if self._is_pp_prefill and not hasattr(
             self.model_runner.model, "get_dspark_context_feature_slice"
         ):
             raise ValueError("DSpark PP prefill currently requires a Kimi-K3 target.")
+        if (
+            _is_npu
+            and self._is_pd_prefill
+            and not self._draft_is_moe
+            and hasattr(self.model_runner.model, "get_dspark_context_feature_slice")
+        ):
+            layer_ids = self.model_runner.spec_aux_config.dflash_target_layer_ids
+            if not layer_ids:
+                raise ValueError("DSpark prefill requires target context layer ids.")
+            feature_slice = self.model_runner.model.get_dspark_context_feature_slice(
+                layer_ids
+            )
+            self._prefill_load_plan = DSparkPrefillLoadPlan(
+                feature_slice=feature_slice,
+                num_context_features=len(layer_ids),
+                load_kv_writer=not self._context_only_pp_rank,
+            )
+            self._context_features = feature_slice
         self._decode_graph_allowed = (
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
             and not self._is_pd_prefill
@@ -172,19 +195,20 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "MoE-under-DP all-reduce."
             )
 
-        with self._draft_context():
-            bundle = build_draft_tp_worker(
-                server_args=server_args,
-                gpu_id=gpu_id,
-                ps=ps,
-                nccl_port=nccl_port,
-                target_model_config=target_worker.model_runner.model_config,
-                algo_label="DSPARK",
-                attention_backend_override=(
-                    DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
-                ),
-                draft_worker_cls=draft_worker_cls,
-            )
+        with dspark_prefill_load_scope(self._prefill_load_plan):
+            with self._draft_context():
+                bundle = build_draft_tp_worker(
+                    server_args=server_args,
+                    gpu_id=gpu_id,
+                    ps=ps,
+                    nccl_port=nccl_port,
+                    target_model_config=target_worker.model_runner.model_config,
+                    algo_label="DSPARK",
+                    attention_backend_override=(
+                        DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
+                    ),
+                    draft_worker_cls=draft_worker_cls,
+                )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
@@ -243,6 +267,45 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._mask_token_id,
                 type(self.draft_model.markov_head).__name__,
             )
+
+        if self._prefill_load_plan is not None:
+            self._target_hidden_projection_enabled = False
+            self._block_pos_offsets = torch.empty(
+                0, dtype=torch.int64, device=self.device
+            )
+            self._draft_block_spec_info = None
+            self._verify_planner = None
+            self._proposer = None
+            self._verify_epilogue = None
+            self._verify_executor = None
+            self._observers = None
+            self._simulate_acc_len = 0.0
+            self._forced_budget_frac = None
+            self._need_mamba_verify_commit = False
+            self._kv_injector = (
+                TargetHiddenKvInjector(
+                    draft_model=self.draft_model,
+                    draft_model_runner=self.draft_model_runner,
+                    model_runner=self.model_runner,
+                    device=self.device,
+                    verify_num_draft_tokens=self.verify_num_draft_tokens,
+                    block_pos_offsets=self._block_pos_offsets,
+                )
+                if self._prefill_load_plan.load_kv_writer
+                else None
+            )
+            if not isinstance(self.draft_model.fc, torch.nn.Linear):
+                raise ValueError("DSpark PP requires a dense context projection.")
+            if self.draft_model.fc.bias is not None:
+                raise ValueError("DSpark PP requires a bias-free context projection.")
+            if (
+                self.draft_model.num_context_features
+                != self._prefill_load_plan.num_context_features
+            ):
+                raise ValueError(
+                    "DSpark target captures do not match draft FC features."
+                )
+            return
 
         self._block_pos_offsets = build_block_pos_offsets(
             length=self.verify_num_draft_tokens, device=self.device
@@ -392,9 +455,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 raise ValueError(
                     "DSpark target captures do not match draft FC features."
                 )
-            self._context_features = (
-                self.model_runner.model.get_dspark_context_feature_slice(layer_ids)
-            )
         if self._context_only_pp_rank:
             # Only the final stage writes and transfers draft KV.
             self.draft_model.layers = torch.nn.ModuleList()
@@ -407,11 +467,13 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     @property
     def carries_confidence(self) -> bool:
-        return self._verify_planner.carries_confidence
+        return (
+            self._verify_planner is not None and self._verify_planner.carries_confidence
+        )
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
-        if self._context_only_pp_rank:
+        if self._prefill_load_plan is not None or self._context_only_pp_rank:
             return (self._target_worker.model_runner.attn_backend,)
         return (
             self._target_worker.model_runner.attn_backend,
@@ -446,7 +508,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
-        if self._context_only_pp_rank:
+        if self._prefill_load_plan is not None or self._context_only_pp_rank:
             return
         with self._draft_context():
             self._draft_worker.init_attention_backends()
@@ -468,7 +530,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
-        if self._context_only_pp_rank:
+        if self._prefill_load_plan is not None or self._context_only_pp_rank:
             return
         capture_decode_cuda_graph = self._decode_graph_allowed
         available_mem = self._tp_sync.available_memory_gb(
@@ -532,19 +594,28 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         self._forced_budget_frac = frac
-        self._verify_planner.set_forced_budget_frac(frac)
+        if self._verify_planner is not None:
+            self._verify_planner.set_forced_budget_frac(frac)
 
     def dump_info_records(self) -> Optional[dict]:
-        return self._observers.dump_info_records()
+        return (
+            self._observers.dump_info_records() if self._observers is not None else None
+        )
 
     def clear_info_records(self) -> None:
-        self._observers.clear_info_records()
+        if self._observers is not None:
+            self._observers.clear_info_records()
 
     def block_accept_estimate_log_suffix(self) -> Optional[str]:
-        return self._observers.block_accept_estimate_log_suffix()
+        return (
+            self._observers.block_accept_estimate_log_suffix()
+            if self._observers is not None
+            else None
+        )
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
-        self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
+        if self._observers is not None:
+            self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
     def forward_batch_generation(
         self,
@@ -558,8 +629,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             or batch.forward_mode.is_extend()
             or batch.is_extend_in_batch
         ):
-            self._verify_planner.note_non_decode_step()
-            self._observers.note_prefill_step()
+            if self._verify_planner is not None:
+                self._verify_planner.note_non_decode_step()
+            if self._observers is not None:
+                self._observers.note_prefill_step()
             return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
@@ -1027,4 +1100,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def get_confidence_budget_prepare(self):
-        return self._verify_planner.confidence_budget_prepare()
+        return (
+            self._verify_planner.confidence_budget_prepare()
+            if self._verify_planner is not None
+            else None
+        )

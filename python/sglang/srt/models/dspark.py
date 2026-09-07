@@ -483,6 +483,11 @@ class DSparkDraftMixin:
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        from sglang.srt.speculative.dspark_components.dspark_pp import (
+            get_dspark_prefill_load_plan,
+        )
+
+        prefill_plan = get_dspark_prefill_load_plan()
         self._fused_kv_write_cache = None
         self.logits_mup_width_multiplier = None
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
@@ -493,13 +498,17 @@ class DSparkDraftMixin:
             )
         self.gamma = int(dspark_config.resolve_gamma(default=self.block_size))
         self.sample_from_anchor = get_dspark_sample_from_anchor(config)
-        if self.is_nemotron_35_draft:
+        if prefill_plan is not None:
+            self.markov_head = None
+            self.confidence_head = None
+        elif self.is_nemotron_35_draft:
             self.markov_head = build_nemotron_35_markov_head(
                 config, quant_config, prefix
             )
         else:
             self.markov_head = build_markov_head(config)
-        self.confidence_head = build_confidence_head(config)
+        if prefill_plan is None:
+            self.confidence_head = build_confidence_head(config)
         self.lm_head: Optional[nn.Module] = None
         # Expose the draft's own layer count so the draft ModelRunner sizes the
         # draft KV pool correctly. Some DSpark draft checkpoints inherit the
@@ -574,6 +583,8 @@ class DSparkDraftMixin:
         super().load_weights(backbone_weights)
 
         for name, loaded_weight in markov_weights:
+            if self.markov_head is None:
+                continue
             if name not in params_dict:
                 raise ValueError(
                     f"DSpark unexpected markov weight {name!r} not found in model "

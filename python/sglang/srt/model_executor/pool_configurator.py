@@ -54,6 +54,7 @@ from sglang.srt.utils.common import (
     ceil_div,
     is_float4_e2m1fn_x2,
     is_hip,
+    is_npu,
     spec_decode_alloc_len_per_request,
 )
 
@@ -98,6 +99,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _has_dflash_draft_pool(kvc: KVCacheConfigurator) -> bool:
+    if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
+        return False
+    parallel = get_parallel()
+    return not (
+        is_npu()
+        and get_disagg().disaggregation_mode == "prefill"
+        and parallel.pp_size > 1
+        and parallel.pp_rank < parallel.pp_size - 1
+    )
+
+
 def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     """Bytes/token the DFLASH draft KV pool adds to the target's budget, 0 if none.
 
@@ -107,7 +120,7 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     pool spans the allocator's widened virtual location space, so the draft
     term is replicated across DCP ranks.
     """
-    if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
+    if not _has_dflash_draft_pool(kvc):
         return 0
     cell_size = kvc.spec_aux_config.dflash_draft_cell_size_per_token
     if cell_size is None or int(cell_size) <= 0:
@@ -270,7 +283,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # max_total_num_tokens, whose per-token footprint can differ from the
         # target's (e.g. an MLA-latent target paired with a full per-head K/V
         # draft), so size from the draft config rather than the layer ratio.
-        if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
+        if _has_dflash_draft_pool(kvc):
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
             )
