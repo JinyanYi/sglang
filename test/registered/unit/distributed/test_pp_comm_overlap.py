@@ -7,6 +7,7 @@ from unittest.mock import Mock, call
 import torch
 
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -96,6 +97,92 @@ class TestPPCommOverlap(CustomTestCase):
 
         self.assertIs(received, tensor_dict)
         self.assertIs(event, recv_event)
+
+    def test_cpu_output_relay_bypasses_tp_all_gather_only_for_outputs(self):
+        tp_group = object()
+        pp_group = Mock()
+        pp_group.send_tensor_dict.return_value = []
+        scheduler = _make_scheduler(
+            pp_output_via_cpu=True,
+            attn_tp_group=tp_group,
+            pp_group=pp_group,
+            pp_comm_stream_ctx=nullcontext(),
+        )
+
+        scheduler._pp_send_dict_to_next_stage(
+            {"next_token_ids": torch.arange(2)}, msg_type="output"
+        )
+        self.assertIsNone(
+            pp_group.send_tensor_dict.call_args.kwargs["all_gather_group"]
+        )
+
+        scheduler._pp_send_dict_to_next_stage(
+            {"hidden_states": torch.arange(2)}, msg_type="proxy"
+        )
+        self.assertIs(
+            pp_group.send_tensor_dict.call_args.kwargs["all_gather_group"], tp_group
+        )
+
+    def test_cpu_output_relay_receive_bypasses_tp_all_gather(self):
+        recv = Mock(return_value=({}, None))
+        scheduler = _make_scheduler(
+            pp_output_via_cpu=True,
+            attn_tp_group=object(),
+            _pp_recv_typed_dict=recv,
+        )
+
+        scheduler._pp_recv_dict_from_prev_stage()
+
+        recv.assert_called_once_with(expected_kind="output", all_gather_group=None)
+
+    @unittest.skipUnless(
+        hasattr(torch, "npu") and torch.npu.is_available(), "requires NPU"
+    )
+    def test_cpu_output_relay_preserves_bytes_and_cpu_forward_buffer(self):
+        device = torch.device("npu:0")
+        torch.npu.set_device(device)
+        token_ids = torch.tensor([3, 17, 4096], dtype=torch.int64, device=device)
+        original = PPProxyTensors(
+            {"next_token_ids": token_ids, "cpu_tensor": torch.tensor([23])}
+        )
+        event = torch.npu.Event()
+        event.record(torch.npu.current_stream())
+        pp_group = Mock(is_last_rank=True, is_first_rank=False)
+        pp_group.send_tensor_dict.return_value = []
+        scheduler = _make_scheduler(
+            pp_output_via_cpu=True,
+            pp_group=pp_group,
+            attn_tp_group=object(),
+            pp_comm_stream_ctx=nullcontext(),
+            device_module=torch.npu,
+            device=device,
+            _pp_spec_relay=False,
+            future_map=Mock(),
+        )
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_prebuilt=lambda: False),
+            return_logprob=False,
+            spec_algorithm=SimpleNamespace(is_dspark=lambda: False),
+            req_pool_indices=None,
+            input_ids=None,
+        )
+
+        scheduler._pp_send_output_to_next_stage(
+            0, [batch], deque([(event, original)]), None
+        )
+        relayed = pp_group.send_tensor_dict.call_args.kwargs["tensor_dict"]
+        self.assertEqual(relayed["__pp_output_device_keys__"], ["next_token_ids"])
+        self.assertEqual(relayed["next_token_ids"].device.type, "cpu")
+        self.assertIs(relayed["cpu_tensor"], original["cpu_tensor"])
+        self.assertTrue(torch.equal(relayed["next_token_ids"], token_ids.cpu()))
+        self.assertEqual(original["next_token_ids"].device.type, "npu")
+
+        local_result = scheduler._pp_prep_batch_result(
+            batch, SimpleNamespace(can_run_cuda_graph=False), PPProxyTensors(relayed)
+        )
+        self.assertEqual(local_result.next_token_ids.device.type, "npu")
+        self.assertTrue(torch.equal(local_result.next_token_ids.cpu(), token_ids.cpu()))
+        self.assertEqual(relayed["next_token_ids"].device.type, "cpu")
 
 
 if __name__ == "__main__":

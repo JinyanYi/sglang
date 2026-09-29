@@ -660,6 +660,10 @@ class Envs:
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
+    # Relay PP output tensors over the CPU (Gloo) group on NPU with PP > 2.
+    # This avoids a cold HCCL P2P communicator setup deadlock when every
+    # stage in the output ring posts its send before its receive.
+    SGLANG_PP_OUTPUT_VIA_CPU = EnvBool(False)
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)

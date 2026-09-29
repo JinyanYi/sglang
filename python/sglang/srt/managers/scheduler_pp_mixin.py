@@ -579,6 +579,21 @@ class SchedulerPPMixin:
                     self.on_idle()
 
     def init_pp_loop_state(self: Scheduler):
+        self.pp_output_via_cpu = (
+            _is_npu
+            and get_parallel().pp_size > 2
+            and envs.SGLANG_PP_OUTPUT_VIA_CPU.get()
+        )
+        if (
+            self.pp_output_via_cpu
+            and envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get()
+        ):
+            raise ValueError(
+                "SGLANG_PP_OUTPUT_VIA_CPU and "
+                "SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM cannot be enabled together"
+            )
+        if self.pp_output_via_cpu:
+            logger.info("PP output relay over CPU/Gloo is enabled")
         self.pp_loop_size: int = (
             get_parallel().pp_size + get_parallel().pp_async_batch_depth
         )
@@ -944,6 +959,13 @@ class SchedulerPPMixin:
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
         tensor_dict["__msg_type__"] = msg_type
+        # Output tensors are replicated across attention TP ranks. CPU relay
+        # sends each full replica instead of slicing it for device all-gather.
+        all_gather_group = (
+            None
+            if msg_type == "output" and self.pp_output_via_cpu
+            else self.attn_tp_group
+        )
         p2p_work = []
         with self.pp_comm_stream_ctx:
             if ready_event is not None:
@@ -951,7 +973,7 @@ class SchedulerPPMixin:
             p2p_work.extend(
                 self.pp_group.send_tensor_dict(
                     tensor_dict=tensor_dict,
-                    all_gather_group=(self.attn_tp_group),
+                    all_gather_group=all_gather_group,
                     async_send=async_send,
                 )
             )
@@ -1022,7 +1044,7 @@ class SchedulerPPMixin:
     ) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]:
         return self._pp_recv_typed_dict(
             expected_kind="output",
-            all_gather_group=(self.attn_tp_group),
+            all_gather_group=(None if self.pp_output_via_cpu else self.attn_tp_group),
         )
 
     def _pp_make_skip_output_result(
@@ -1055,6 +1077,18 @@ class SchedulerPPMixin:
         pp_outputs: PPProxyTensors,
     ):
         from sglang.srt.managers.scheduler import GenerationBatchResult
+
+        if self.pp_output_via_cpu:
+            # Keep the received CPU tensors in next_pp_outputs for the next
+            # relay hop. Only restore device tensors for this rank's consumer.
+            device_keys = pp_outputs.tensors["__pp_output_device_keys__"]
+            pp_outputs = PPProxyTensors(
+                {
+                    key: value.to(self.device) if key in device_keys else value
+                    for key, value in pp_outputs.tensors.items()
+                    if key != "__pp_output_device_keys__"
+                }
+            )
 
         logits_output = None
         extend_input_len_per_req = None
@@ -1478,11 +1512,26 @@ class SchedulerPPMixin:
                     and not _pp_can_skip_output_comm(target)
                 ):
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
+                        tensors = pp_outputs_to_send.tensors
+                        if self.pp_output_via_cpu:
+                            # The queued result may still be produced on another
+                            # stream. The D2H copy must wait for that result.
+                            self.device_module.current_stream().wait_event(q_event)
+                            device_keys = [
+                                key
+                                for key, value in tensors.items()
+                                if isinstance(value, torch.Tensor) and not value.is_cpu
+                            ]
+                            tensors = {
+                                key: value.cpu() if key in device_keys else value
+                                for key, value in tensors.items()
+                            }
+                            tensors["__pp_output_device_keys__"] = device_keys
                         send_output_work = self._pp_send_dict_to_next_stage(
-                            pp_outputs_to_send.tensors,
+                            tensors,
                             async_send=True,
                             msg_type="output",
-                            ready_event=q_event,
+                            ready_event=None if self.pp_output_via_cpu else q_event,
                         )
         # send the outputs from the last round to let the next stage worker run post processing
         if not self.pp_group.is_last_rank:
