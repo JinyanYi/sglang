@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 model=${1:-/home/weights/Qwen3-0.6B}
 devices=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3}
+pp_size=${PP_TEST_PP_SIZE:-4}
 port=${PP_TEST_PORT:-30088}
 log_dir=${PP_TEST_LOG_DIR:-"$PWD/pp4-e2e-$(date +%Y%m%d-%H%M%S)"}
 disable_graph=${PP_TEST_DISABLE_GRAPH:-0}
@@ -29,8 +30,12 @@ if [[ -n "$graph_bs" ]]; then
   graph_args+=(--cuda-graph-config "{\"decode\":{\"bs\":[${graph_bs}]}}")
 fi
 IFS=, read -r -a device_list <<< "$devices"
-if (( ${#device_list[@]} != 4 )); then
-  echo "Select exactly four free NPUs in ASCEND_RT_VISIBLE_DEVICES" >&2
+if [[ "$pp_size" != 1 && "$pp_size" != 2 && "$pp_size" != 4 ]]; then
+  echo "PP_TEST_PP_SIZE must be 1, 2, or 4" >&2
+  exit 2
+fi
+if (( ${#device_list[@]} != pp_size )); then
+  echo "Select exactly $pp_size free NPUs in ASCEND_RT_VISIBLE_DEVICES" >&2
   exit 2
 fi
 if [[ ! -f "$model/config.json" ]]; then
@@ -79,8 +84,8 @@ if commit=$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null); then
 else
   echo "Source commit: unavailable (copied test checkout)"
 fi
-echo "Model: $model; TP=1 PP=4; NPUs: $devices; port: $port"
-echo "CPU relay=1; ASCEND_USE_FIA=$use_fia; disable graph=$disable_graph"
+echo "Model: $model; TP=1 PP=$pp_size; NPUs: $devices; port: $port"
+echo "CPU relay requested=1 (active only for NPU PP>2); ASCEND_USE_FIA=$use_fia; disable graph=$disable_graph"
 echo "Decode graph capture batch sizes: ${graph_bs:-default}"
 echo "Starting server; live output is also saved to $server_log"
 ASCEND_RT_VISIBLE_DEVICES="$devices" \
@@ -91,7 +96,7 @@ SGLANG_ENABLE_PP_SPEC=0 \
 setsid python -m sglang.launch_server \
   --model-path "$model" \
   --host 127.0.0.1 --port "$port" \
-  --tp-size 1 --pp-size 4 \
+  --tp-size 1 --pp-size "$pp_size" \
   --context-length 2048 \
   --max-total-tokens 4096 \
   --mem-fraction-static 0.15 \
@@ -129,4 +134,4 @@ timeout --signal=TERM --kill-after=10s 420s \
   --url "http://127.0.0.1:$port" --out "$client_log"
 curl --silent --show-error --fail --max-time 30 \
   "http://127.0.0.1:$port/health_generate" >/dev/null
-echo "PASS: PP4 model requests and final health generation completed"
+echo "PASS: PP$pp_size model requests and final health generation completed"
