@@ -6,6 +6,20 @@ model=${1:-/home/weights/Qwen3-0.6B}
 devices=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3}
 port=${PP_TEST_PORT:-30088}
 log_dir=${PP_TEST_LOG_DIR:-"$PWD/pp4-e2e-$(date +%Y%m%d-%H%M%S)"}
+disable_graph=${PP_TEST_DISABLE_GRAPH:-0}
+use_fia=${ASCEND_USE_FIA:-0}
+if [[ "$disable_graph" != 0 && "$disable_graph" != 1 ]]; then
+  echo "PP_TEST_DISABLE_GRAPH must be 0 or 1" >&2
+  exit 2
+fi
+if [[ "$use_fia" != 0 && "$use_fia" != 1 ]]; then
+  echo "ASCEND_USE_FIA must be 0 or 1" >&2
+  exit 2
+fi
+graph_args=()
+if [[ "$disable_graph" == 1 ]]; then
+  graph_args+=(--disable-cuda-graph)
+fi
 IFS=, read -r -a device_list <<< "$devices"
 if (( ${#device_list[@]} != 4 )); then
   echo "Select exactly four free NPUs in ASCEND_RT_VISIBLE_DEVICES" >&2
@@ -58,8 +72,10 @@ else
   echo "Source commit: unavailable (copied test checkout)"
 fi
 echo "Model: $model; TP=1 PP=4; NPUs: $devices; port: $port"
+echo "CPU relay=1; ASCEND_USE_FIA=$use_fia; disable graph=$disable_graph"
 echo "Starting server; live output is also saved to $server_log"
 ASCEND_RT_VISIBLE_DEVICES="$devices" \
+ASCEND_USE_FIA="$use_fia" \
 SGLANG_PP_OUTPUT_VIA_CPU=1 \
 SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM=0 \
 SGLANG_ENABLE_PP_SPEC=0 \
@@ -71,6 +87,7 @@ setsid python -m sglang.launch_server \
   --max-total-tokens 4096 \
   --mem-fraction-static 0.15 \
   --chunked-prefill-size 256 \
+  "${graph_args[@]}" \
   > >(tee "$server_log") 2>&1 &
 server_pid=$!
 server_pgid=$(ps -o pgid= -p "$server_pid" | tr -d '[:space:]')
