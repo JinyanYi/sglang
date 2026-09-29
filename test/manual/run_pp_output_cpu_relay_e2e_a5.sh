@@ -8,6 +8,7 @@ port=${PP_TEST_PORT:-30088}
 log_dir=${PP_TEST_LOG_DIR:-"$PWD/pp4-e2e-$(date +%Y%m%d-%H%M%S)"}
 disable_graph=${PP_TEST_DISABLE_GRAPH:-0}
 use_fia=${ASCEND_USE_FIA:-0}
+graph_bs=${PP_TEST_GRAPH_BS:-}
 if [[ "$disable_graph" != 0 && "$disable_graph" != 1 ]]; then
   echo "PP_TEST_DISABLE_GRAPH must be 0 or 1" >&2
   exit 2
@@ -19,6 +20,13 @@ fi
 graph_args=()
 if [[ "$disable_graph" == 1 ]]; then
   graph_args+=(--disable-cuda-graph)
+fi
+if [[ -n "$graph_bs" ]]; then
+  if [[ "$disable_graph" == 1 || ! "$graph_bs" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]]; then
+    echo "PP_TEST_GRAPH_BS requires graph on and comma-separated positive integers" >&2
+    exit 2
+  fi
+  graph_args+=(--cuda-graph-config "{\"decode\":{\"bs\":[${graph_bs}]}}")
 fi
 IFS=, read -r -a device_list <<< "$devices"
 if (( ${#device_list[@]} != 4 )); then
@@ -73,6 +81,7 @@ else
 fi
 echo "Model: $model; TP=1 PP=4; NPUs: $devices; port: $port"
 echo "CPU relay=1; ASCEND_USE_FIA=$use_fia; disable graph=$disable_graph"
+echo "Decode graph capture batch sizes: ${graph_bs:-default}"
 echo "Starting server; live output is also saved to $server_log"
 ASCEND_RT_VISIBLE_DEVICES="$devices" \
 ASCEND_USE_FIA="$use_fia" \
