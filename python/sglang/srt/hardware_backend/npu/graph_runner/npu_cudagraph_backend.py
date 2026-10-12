@@ -63,6 +63,11 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._enable_torch_compile = getattr(
             cuda_graph_runner, "enable_torch_compile", False
         )
+        # Diagnostic only: check whether pending device work contributes to
+        # SQ exhaustion when a captured graph is replayed.
+        self._sync_before_replay = get_bool_env_var(
+            "SGLANG_NPU_GRAPH_SYNC_BEFORE_REPLAY"
+        )
         # Reuse one device-bound worker for graph input updates.
         self._update_executor = ThreadPoolExecutor(
             max_workers=1,
@@ -149,6 +154,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        if self._sync_before_replay:
+            self._device_module.synchronize()
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 
@@ -178,6 +185,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
         graph = self._graphs[shape_key]
 
+        if self._sync_before_replay:
+            self._device_module.synchronize()
         if self._rebind_fence is not None:
             self._rebind_fence.synchronize()
 

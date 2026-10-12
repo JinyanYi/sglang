@@ -87,6 +87,7 @@ fi
 echo "Model: $model; TP=1 PP=$pp_size; NPUs: $devices; port: $port"
 echo "CPU relay requested=1 (active only for NPU PP>2); ASCEND_USE_FIA=$use_fia; disable graph=$disable_graph"
 echo "Decode graph capture batch sizes: ${graph_bs:-default}"
+echo "Sync before NPU graph replay: ${SGLANG_NPU_GRAPH_SYNC_BEFORE_REPLAY:-0}"
 echo "Starting server; live output is also saved to $server_log"
 ASCEND_RT_VISIBLE_DEVICES="$devices" \
 ASCEND_USE_FIA="$use_fia" \
