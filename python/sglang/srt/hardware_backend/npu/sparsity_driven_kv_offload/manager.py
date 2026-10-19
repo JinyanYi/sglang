@@ -13,6 +13,14 @@ from sgl_kernel_npu.sparsity_driven_kv_offload import (
 )
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables import (
+    fill_request_block_table,
+)
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.copy_sfa_buffers import (
+    copy_sfa_host_row_stride,
+    view_copy_sfa_output,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
@@ -75,6 +83,7 @@ class SparseKVCacheManager:
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         sparse_context_len: int,
+        copy_sfa_padded_query_heads: Optional[int] = None,
     ) -> None:
         enable_memory_saver = False
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -84,8 +93,29 @@ class SparseKVCacheManager:
         # Include the padding row because real request IDs can equal the
         # configured capacity when row 0 is reserved for graph padding.
         self.size = int(req_to_token_pool.req_to_token.shape[0])
-        self.max_context_len = req_to_token_pool.max_context_len
+        self.logical_max_context_len = int(req_to_token_pool.max_context_len)
         self.sparse_context_len = int(sparse_context_len)
+        self.cache_capacity = self.sparse_context_len
+        self.copy_sfa_enabled = bool(
+            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
+            and envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
+        )
+        self.max_context_len = copy_sfa_host_row_stride(
+            self.logical_max_context_len, self.copy_sfa_enabled
+        )
+        if self.copy_sfa_enabled:
+            # The registered DRAM block table addresses 128-token pages. Keep
+            # this manager-owned stride page-aligned without changing the
+            # request pool's logical context limit.
+            if copy_sfa_padded_query_heads is None or copy_sfa_padded_query_heads <= 0:
+                raise ValueError(
+                    "Copy-SFA requires the padded query head count at manager initialization."
+                )
+            if self.cache_capacity != 2048:
+                raise ValueError(
+                    "Copy-SFA currently requires a 2048-token sparse cache; "
+                    f"got {self.cache_capacity}."
+                )
         if self.sparse_context_len <= 0:
             raise ValueError(
                 "SparseKVCacheManager requires a positive sparse_context_len, "
@@ -110,6 +140,22 @@ class SparseKVCacheManager:
         )
         self.store_dtype = self.paged_kv_cache.store_dtype
         self.layer_num = self.paged_kv_cache.layer_num
+        if self.copy_sfa_enabled:
+            if (self.kv_lora_rank, self.qk_rope_head_dim) != (512, 64):
+                raise ValueError(
+                    "Copy-SFA supports only MLA KV dimensions CKV=512 and KPE=64; "
+                    f"got CKV={self.kv_lora_rank}, KPE={self.qk_rope_head_dim}."
+                )
+            if self.store_dtype not in (torch.bfloat16, torch.float16):
+                raise ValueError(
+                    "Copy-SFA supports only BF16 or FP16 KV storage; "
+                    f"got {self.store_dtype}."
+                )
+            from sgl_kernel_npu.sparsity_driven_kv_offload import plan_sparse_kv_cache
+
+            self._plan_sparse_kv_cache = plan_sparse_kv_cache
+        else:
+            self._plan_sparse_kv_cache = None
         self._materialize_d2d_hit_stream = torch.npu.Stream()
         self._materialize_h2d_miss_stream = torch.npu.Stream()
         self._materialize_refill_stream = torch.npu.Stream()
@@ -163,6 +209,81 @@ class SparseKVCacheManager:
                 self._device_slot_map_minus_one = torch.full_like(
                     self.device_slot_map[0], -1
                 )
+                if self.copy_sfa_enabled:
+                    self.device_slot_owner: list[torch.Tensor] = [
+                        torch.full(
+                            (self.size + 1, self.cache_capacity),
+                            -1,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self._device_slot_owner_minus_one = torch.full_like(
+                        self.device_slot_owner[0], -1
+                    )
+                    self.planner_topk_src_ids = torch.full(
+                        (self.size, 1, self.cache_capacity),
+                        -1,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    self.planner_topk_dst_slots = torch.full_like(
+                        self.planner_topk_src_ids, -1
+                    )
+                    self.planner_topk_miss_counts = torch.zeros(
+                        (self.size,), dtype=torch.int32, device=self.device
+                    )
+                    self.planner_miss_src_ids = torch.full(
+                        (self.size, self.cache_capacity),
+                        -1,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    self.planner_miss_dst_slots = torch.full_like(
+                        self.planner_miss_src_ids, -1
+                    )
+                    self.planner_miss_counts = torch.zeros(
+                        (self.size,), dtype=torch.int32, device=self.device
+                    )
+                    self.planner_actual_seq_lengths_query = torch.arange(
+                        1, self.size + 1, dtype=torch.int32, device=self.device
+                    )
+                    self.planner_actual_seq_lengths_kv = torch.empty_like(
+                        self.planner_actual_seq_lengths_query
+                    )
+                    self.planner_num_cache_tokens = torch.empty_like(
+                        self.planner_actual_seq_lengths_query
+                    )
+                    self.hbm_page_offsets = torch.arange(
+                        self.cache_capacity // 128,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    self.dram_page_offsets = torch.arange(
+                        self.max_context_len // 128,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    self.planner_hbm_block_table = torch.empty(
+                        (self.size, self.cache_capacity // 128),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    self.planner_dram_block_table = torch.empty(
+                        (self.size, self.max_context_len // 128),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    self.planner_attn_out = torch.empty(
+                        (
+                            self.size,
+                            copy_sfa_padded_query_heads,
+                            self.kv_lora_rank,
+                        ),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
         except Exception as e:
             self._raise_buffer_allocation_error("device_slot_map", e)
 
@@ -218,7 +339,8 @@ class SparseKVCacheManager:
         raise RuntimeError(
             "Failed to allocate sparse KV buffer "
             f"{buffer_name}: req_capacity={self.size}, "
-            f"max_context_len={self.max_context_len}, "
+            f"logical_max_context_len={self.logical_max_context_len}, "
+            f"host_row_stride={self.max_context_len}, "
             f"sparse_context_len={self.sparse_context_len}. "
             "The sparse KV request capacity may be too large; set a smaller "
             "--max-running-requests for sparse KV offload."
@@ -245,6 +367,159 @@ class SparseKVCacheManager:
         ).contiguous()
         for layer_idx in range(self.layer_num):
             self.device_slot_map[layer_idx].index_fill_(0, req_ids_tensor, -1)
+            if self.copy_sfa_enabled:
+                self.device_slot_owner[layer_idx].index_fill_(0, req_ids_tensor, -1)
+
+    def plan_decode_cache(
+        self,
+        layer: RadixAttention,
+        req_ids: torch.Tensor,
+        seq_lens: torch.Tensor,
+        topk_src_ids: torch.Tensor,
+    ):
+        """Update stable source/slot maps and fill graph-stable Copy-SFA metadata."""
+        layer_idx = layer.layer_id - self.start_layer
+        batch_size = req_ids.shape[0]
+        req_ids_i32 = req_ids.to(dtype=torch.int32).contiguous()
+        topk_src_ids_i32 = (
+            normalize_batch_topk_indices(topk_src_ids)
+            .to(dtype=torch.int32)
+            .contiguous()
+        )
+        valid_req = (
+            (req_ids_i32 >= 0) & (req_ids_i32 < self.size) & (seq_lens[:batch_size] > 0)
+        )
+        # Graph padding uses request ID zero, which is also a valid live row.
+        # Convert padded rows to the manager's reserved request sentinel so the
+        # native planner returns before reading either cache map.
+        planner_req_ids = torch.where(
+            valid_req, req_ids_i32, torch.full_like(req_ids_i32, self.size)
+        )
+        self._plan_sparse_kv_cache(
+            self.device_slot_map[layer_idx],
+            self.device_slot_owner[layer_idx],
+            planner_req_ids,
+            topk_src_ids_i32,
+            self.planner_topk_src_ids[:batch_size],
+            self.planner_topk_dst_slots[:batch_size],
+            self.planner_topk_miss_counts[:batch_size],
+            self.planner_miss_src_ids[:batch_size],
+            self.planner_miss_dst_slots[:batch_size],
+            self.planner_miss_counts[:batch_size],
+            max_context_len=self.logical_max_context_len,
+            cache_capacity=self.cache_capacity,
+        )
+        # Keep dense Q row positions stable; padded K/cache rows have length 0.
+        valid_req_i32 = valid_req.to(torch.int32)
+        kv_lengths = valid_req_i32 * self.cache_capacity
+        self.planner_actual_seq_lengths_kv[:batch_size].copy_(kv_lengths)
+        self.planner_num_cache_tokens[:batch_size].copy_(kv_lengths)
+        hbm_block_table = self.planner_hbm_block_table[:batch_size]
+        fill_request_block_table(
+            req_ids_i32,
+            valid_req,
+            self.hbm_page_offsets,
+            self.cache_capacity // 128,
+            hbm_block_table,
+        )
+        dram_block_table = self.planner_dram_block_table[:batch_size]
+        fill_request_block_table(
+            req_ids_i32,
+            valid_req,
+            self.dram_page_offsets,
+            self.max_context_len // 128,
+            dram_block_table,
+        )
+        return (
+            self.planner_topk_src_ids[:batch_size],
+            self.planner_topk_dst_slots[:batch_size],
+            self.planner_topk_miss_counts[:batch_size],
+            self.planner_miss_src_ids[:batch_size],
+            self.planner_miss_dst_slots[:batch_size],
+            self.planner_miss_counts[:batch_size],
+            self.planner_actual_seq_lengths_query[:batch_size],
+            self.planner_actual_seq_lengths_kv[:batch_size],
+            self.planner_num_cache_tokens[:batch_size],
+            self.planner_hbm_block_table[:batch_size],
+            self.planner_dram_block_table[:batch_size],
+        )
+
+    def copy_sfa_decode(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        query_nope: torch.Tensor,
+        query_rope: torch.Tensor,
+        query_heads: int,
+        scale_value: float,
+        topk_src_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Plan cache residency and run the fused scatter/copy/SFA operator."""
+        batch_size = forward_batch.batch_size
+        metadata = self.plan_decode_cache(
+            layer,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            topk_src_ids,
+        )
+        (
+            topk_src,
+            topk_dst,
+            topk_miss_counts,
+            miss_src,
+            miss_dst,
+            miss_counts,
+            actual_seq_lengths_query,
+            actual_seq_lengths_kv,
+            num_cache_tokens,
+            hbm_block_table,
+            dram_block_table,
+        ) = metadata
+        query_nope = query_nope.squeeze(1).contiguous()
+        query_rope = query_rope.squeeze(1).contiguous()
+        output_buffer = self.planner_attn_out
+        if (
+            query_nope.shape[1] > output_buffer.shape[1]
+            or query_nope.shape[2] != output_buffer.shape[2]
+            or query_nope.dtype != output_buffer.dtype
+            or batch_size > output_buffer.shape[0]
+        ):
+            raise RuntimeError(
+                "Copy-SFA query exceeds its preallocated output contract: "
+                f"query={tuple(query_nope.shape)} {query_nope.dtype}, "
+                f"output={tuple(output_buffer.shape)} {output_buffer.dtype}."
+            )
+        attention_out = view_copy_sfa_output(
+            output_buffer,
+            batch_size,
+            query_nope.shape[1],
+            query_nope.shape[2],
+        )
+
+        layer_idx = layer.layer_id - self.start_layer
+        combined_hbm_cache = self.device_kv_buffer[layer_idx].view(
+            self.size * (self.cache_capacity // 128), 128, self.head_num, self.head_dim
+        )
+        torch.ops.npu.fused_scatter_copy_sparse_flash_attention(
+            query_nope,
+            query_rope,
+            combined_hbm_cache,
+            actual_seq_lengths_query,
+            actual_seq_lengths_kv,
+            num_cache_tokens,
+            topk_src,
+            topk_dst,
+            topk_miss_counts,
+            miss_src,
+            miss_dst,
+            miss_counts,
+            hbm_block_table,
+            dram_block_table,
+            self.dev_ptr_list[layer_idx],
+            attention_out,
+            scale_value,
+        )
+        return attention_out[:, :query_heads].reshape(batch_size, -1)
 
     def _install_req_alloc_hook(self, req_to_token_pool: ReqToTokenPool) -> None:
         original_alloc = getattr(
@@ -304,6 +579,8 @@ class SparseKVCacheManager:
                 (forward_batch.seq_lens != 1)
                 & (src_token_indices >= 0)
                 & (req_ids >= 0)
+                & (token_pos >= 0)
+                & (token_pos < self.logical_max_context_len)
             ).contiguous()
 
         else:
@@ -434,7 +711,7 @@ class SparseKVCacheManager:
                 & (cache_loc >= 0)
                 & (req_ids >= 0)
                 & (token_pos >= 0)
-                & (token_pos < self.max_context_len)
+                & (token_pos < self.logical_max_context_len)
             ).contiguous()
         else:
             if (
@@ -510,7 +787,7 @@ class SparseKVCacheManager:
                 valid_mask = (
                     (flat_req_ids >= 0)
                     & (token_pos >= 0)
-                    & (token_pos < self.max_context_len)
+                    & (token_pos < self.logical_max_context_len)
                 )
             else:
                 if num_src_rows % batch_size != 0:
@@ -543,7 +820,7 @@ class SparseKVCacheManager:
                     (local_offsets < extend_seq_lens.unsqueeze(1))
                     & (req_ids_2d >= 0)
                     & (token_pos_2d >= 0)
-                    & (token_pos_2d < self.max_context_len)
+                    & (token_pos_2d < self.logical_max_context_len)
                 ).reshape(-1)
 
             if (
@@ -641,10 +918,10 @@ class SparseKVCacheManager:
             raise RuntimeError(
                 f"get_forward_kv got req id outside sparse pool size {self.size}."
             )
-        if bool((seq_lens > self.max_context_len).any().item()):
+        if bool((seq_lens > self.logical_max_context_len).any().item()):
             raise RuntimeError(
                 "get_forward_kv got seq_len larger than max_context_len "
-                f"{self.max_context_len}."
+                f"{self.logical_max_context_len}."
             )
 
         total_tokens = int(seq_lens.sum().item())
@@ -725,7 +1002,7 @@ class SparseKVCacheManager:
                 )
             valid_topk_mask = (
                 (topk_indices >= 0)
-                & (topk_indices < self.max_context_len)
+                & (topk_indices < self.logical_max_context_len)
                 & valid_req_mask.unsqueeze(1)
             )
 
@@ -828,6 +1105,10 @@ class SparseKVCacheManager:
         with torch.npu.stream(self._materialize_slot_map_stream):
             _wait_stream_event(self._materialize_slot_map_stream, copy_ready)
             self.device_slot_map[layer_idx].copy_(self._device_slot_map_minus_one)
+            if self.copy_sfa_enabled:
+                self.device_slot_owner[layer_idx].copy_(
+                    self._device_slot_owner_minus_one
+                )
 
             slot_map_token_indices = torch.where(
                 valid_topk_mask,
@@ -857,6 +1138,33 @@ class SparseKVCacheManager:
                 1,
                 block_dim=48,
             )
+            if self.copy_sfa_enabled:
+                # Keep the inverse map coherent whenever the legacy fallback
+                # rewrites cache contents, so a later fused planner never
+                # treats stale residency as a valid hit.
+                owner_values = torch.where(
+                    valid_topk_mask,
+                    topk_indices.to(torch.int32),
+                    torch.full_like(topk_indices, -1, dtype=torch.int32),
+                )
+                owner_flat_indices = (
+                    slot_map_row_indices.unsqueeze(1) * self.cache_capacity
+                    + cache_slot_ids.view(1, -1)
+                ).reshape(-1)
+                unidex_copy_inplace(
+                    owner_values.reshape(-1, 1).contiguous(),
+                    self.device_slot_owner[layer_idx].view(-1, 1),
+                    torch.arange(
+                        owner_values.numel(),
+                        dtype=torch.long,
+                        device=topk_indices.device,
+                    ),
+                    owner_flat_indices,
+                    valid_topk_mask.reshape(-1),
+                    1,
+                    1,
+                    block_dim=48,
+                )
             _record_stream_event(self._materialize_slot_map_stream, self.slot_map_done)
 
 
