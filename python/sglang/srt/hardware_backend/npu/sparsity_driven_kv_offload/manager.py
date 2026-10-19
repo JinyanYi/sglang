@@ -528,7 +528,7 @@ class SparseKVCacheManager:
         setattr(req_to_token_pool, "_sparse_kv_original_alloc", original_alloc)
 
         def alloc_with_sparse_reset(reqs: list[Req]) -> Optional[List[int]]:
-            newly_allocated = [req.req_pool_idx is None for req in reqs]
+            newly_allocated = [not req.kv.holds_kv for req in reqs]
             req_pool_indices = original_alloc(reqs)
             if req_pool_indices is not None:
                 self.reset_requests(
