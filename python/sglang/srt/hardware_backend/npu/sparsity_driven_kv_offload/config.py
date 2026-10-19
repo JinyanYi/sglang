@@ -22,6 +22,13 @@ def is_sparsity_driven_kv_offload_enabled(
     model_config: ModelConfig,
     use_mla_backend: bool,
 ) -> bool:
+    if (
+        envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
+        and not envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
+    ):
+        raise ValueError(
+            "SGLANG_NPU_ENABLE_COPY_SFA requires SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD."
+        )
     if not envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
         return False
 
