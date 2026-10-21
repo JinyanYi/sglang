@@ -1556,6 +1556,9 @@ class SparseKVCacheManager:
         # Replace the slot-map row with the current top-k mapping. Invalid
         # entries use the max_context_len sentinel column to preserve shape.
         with torch.npu.stream(self._materialize_slot_map_stream):
+            # Keep caller-stream metadata alive for this helper-stream scatter.
+            slot_map_row_indices.record_stream(self._materialize_slot_map_stream)
+            valid_topk_mask.record_stream(self._materialize_slot_map_stream)
             _wait_stream_event(self._materialize_slot_map_stream, copy_ready)
             self.device_slot_map[layer_idx].copy_(self._device_slot_map_minus_one)
             if self.copy_sfa_enabled:
