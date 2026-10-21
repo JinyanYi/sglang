@@ -81,7 +81,9 @@ def is_sparsity_driven_kv_offload_enabled(
         if not envs.SGLANG_NPU_ENABLE_COPY_SFA.get():
             raise ValueError("LIM indexer requires Copy-SFA to be enabled.")
         if policy != "prefix_tail":
-            raise ValueError("LIM indexer requires SGLANG_NPU_SPARSE_KV_POLICY=prefix_tail.")
+            raise ValueError(
+                "LIM indexer requires SGLANG_NPU_SPARSE_KV_POLICY=prefix_tail."
+            )
         if int(get_dsa_index_topk(model_config.hf_config)) != 2048:
             raise ValueError("LIM indexer requires DSA index_topk=2048.")
         configured_capacity = envs.SGLANG_NPU_SPARSE_KV_CACHE_CAPACITY.get()
@@ -100,8 +102,7 @@ def get_sparse_kv_indexer_impl() -> str:
     value = envs.SGLANG_NPU_SPARSE_KV_INDEXER.get().strip().lower()
     if value not in ("reference", "lim"):
         raise ValueError(
-            "SGLANG_NPU_SPARSE_KV_INDEXER must be 'reference' or 'lim', "
-            f"got {value!r}."
+            f"SGLANG_NPU_SPARSE_KV_INDEXER must be 'reference' or 'lim', got {value!r}."
         )
     return value
 

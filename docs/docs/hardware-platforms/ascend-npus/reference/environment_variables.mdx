@@ -45,6 +45,63 @@ This document provides a list of commonly used environment variables and aims to
   </tbody>
 </table>
 
+## Experimental DSA Sparse KV Offload with Copy-SFA
+
+This opt-in configuration describes the current experimental Ascend DSA/MLA sparse-KV Copy-SFA path; its scope is limited to the constraints below. The default policy is `legacy`; set `prefix_tail` to use the sparse-prefix plus resident-tail layout. Let `K` be the DSA `index_topk`, `L` the visible sequence length, and `C` the on-device cache capacity. Rows with `L <= K` use the dense path. For `L > K`, the stable prefix ends at `P = floor((L - 1) / 128) * 128`. Attention selects `K` positions only from `[0, P)` and appends every visible token in `[P, L)` exactly once; this visible suffix is held in a 256-token resident tail ring separate from `C`. The dense/sparse threshold is `K`, independent of `C`.
+
+The current framework Copy-SFA native planner requires `C = K = 2048`; do not set another capacity for Copy-SFA. The Copy-SFA manager eligibility accepts BF16 or FP16, but validation here covers BF16, Q1 (one query token per request) decode, PP1, and DCP-off. Graph replay scope here is Q1 decode. FP16, MTP, and prefill/decode disaggregation (PD) are not covered by these validation results.
+
+The optional LIM indexer is selected with `SGLANG_NPU_SPARSE_KV_INDEXER=lim`. It requires sparse KV offload, Copy-SFA, `prefix_tail`, BF16, Q1 decode, PP1, DCP-off, page size 128, and `K = C = 2048`. The default `reference` indexer remains selected when this variable is unset. This LIM scope does not establish support for MTP or PD.
+
+<table>
+  <thead>
+    <tr>
+      <th>Environment Variable</th>
+      <th>Description</th>
+      <th>Default Value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD</code></td>
+      <td>Enables sparse KV offload; required for Copy-SFA.</td>
+      <td><code>false</code></td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_NPU_ENABLE_COPY_SFA</code></td>
+      <td>Enables the Copy-SFA path; requires sparse KV offload.</td>
+      <td><code>false</code></td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_NPU_SPARSE_KV_POLICY</code></td>
+      <td>Use <code>prefix_tail</code> for the experimental prefix/tail layout; <code>legacy</code> retains the existing policy.</td>
+      <td><code>legacy</code></td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_NPU_SPARSE_KV_CACHE_CAPACITY</code></td>
+      <td>Optional on-device cache capacity <code>C</code>. For current Copy-SFA, leave unset or set it to <code>2048</code>.</td>
+      <td><code>K</code> when unset</td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_NPU_SPARSE_KV_INDEXER</code></td>
+      <td>Selects the indexer implementation. Set to <code>lim</code> only with the prerequisites above; <code>reference</code> keeps the reference indexer.</td>
+      <td><code>reference</code></td>
+    </tr>
+  </tbody>
+</table>
+
+For a Q1 decode configuration with the LIM indexer, export:
+
+```bash
+export SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD=1
+export SGLANG_NPU_ENABLE_COPY_SFA=1
+export SGLANG_NPU_SPARSE_KV_POLICY=prefix_tail
+export SGLANG_NPU_SPARSE_KV_CACHE_CAPACITY=2048
+export SGLANG_NPU_SPARSE_KV_INDEXER=lim
+```
+
+Use the existing [GLM-5.2 Ascend deployment guide](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2) for model setup and the normal launch command.
+
 ## Used in DeepEP Ascend
 
 <table>
