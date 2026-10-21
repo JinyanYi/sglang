@@ -17,12 +17,12 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables import (
     fill_request_block_table,
 )
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    get_sparse_kv_indexer_impl,
+)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.copy_sfa_buffers import (
     copy_sfa_host_row_stride,
     view_copy_sfa_output,
-)
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
-    get_sparse_kv_indexer_impl,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.prefix_tail import (
     PAGE_SIZE,
@@ -186,13 +186,20 @@ class SparseKVCacheManager:
                 )
             if self.cache_capacity < self.sparse_context_len:
                 raise ValueError("Copy-SFA cache capacity must hold the full TopK.")
+            if self.cache_capacity != 2048:
+                raise ValueError(
+                    "Copy-SFA currently requires cache capacity C=2048; "
+                    f"got {self.cache_capacity}."
+                )
         if self.sparse_context_len <= 0:
             raise ValueError(
                 "SparseKVCacheManager requires a positive sparse_context_len, "
                 f"got {self.sparse_context_len}."
             )
         self.device = req_to_token_pool.device
-        self.source_capacity = (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
+        self.source_capacity = (
+            (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
+        )
         self.prefix_tail_offsets = torch.arange(
             PAGE_SIZE, dtype=torch.long, device=self.device
         )
@@ -470,9 +477,7 @@ class SparseKVCacheManager:
                 LIMDecodeAdapter,
             )
 
-            self.lim_adapter = LIMDecodeAdapter(
-                self
-            )
+            self.lim_adapter = LIMDecodeAdapter(self)
 
     def _raise_buffer_allocation_error(
         self,
@@ -530,14 +535,16 @@ class SparseKVCacheManager:
         req_ids_tensor = torch.tensor(
             req_ids, dtype=torch.long, device=self.device
         ).contiguous()
+        lim_slot_map = getattr(self, "lim_slot_map", None)
+        lim_adapter = getattr(self, "lim_adapter", None)
         for layer_idx in range(self.layer_num):
             self.device_slot_map[layer_idx].index_fill_(0, req_ids_tensor, -1)
-            if self.lim_slot_map is not None:
-                self.lim_slot_map[layer_idx].index_fill_(0, req_ids_tensor, -1)
+            if lim_slot_map is not None:
+                lim_slot_map[layer_idx].index_fill_(0, req_ids_tensor, -1)
             if self.copy_sfa_enabled:
                 self.device_slot_owner[layer_idx].index_fill_(0, req_ids_tensor, -1)
-        if self.lim_adapter is not None:
-            self.lim_adapter.reset_requests(req_ids_tensor)
+        if lim_adapter is not None:
+            lim_adapter.reset_requests(req_ids_tensor)
 
     def plan_decode_cache(
         self,
@@ -551,11 +558,13 @@ class SparseKVCacheManager:
         layer_idx = layer.layer_id - self.start_layer
         batch_size = req_ids.shape[0]
         req_ids_i32 = req_ids.to(dtype=torch.int32).contiguous()
-        topk_src_ids_i32 = (
-            lim_plan.source_ids
-            if lim_plan is not None
-            else normalize_batch_topk_indices(topk_src_ids)
-        ).to(dtype=torch.int32).contiguous()
+        topk_src_ids_i32 = None
+        if lim_plan is None:
+            topk_src_ids_i32 = (
+                normalize_batch_topk_indices(topk_src_ids)
+                .to(dtype=torch.int32)
+                .contiguous()
+            )
         valid_req = valid_sparse_request_rows(req_ids_i32, seq_lens, self.size)
         policy_metadata = (
             self.make_prefix_tail_metadata(seq_lens[:batch_size])
@@ -570,15 +579,15 @@ class SparseKVCacheManager:
         # Graph padding uses request ID zero, which is also a valid live row.
         # Convert padded rows to the manager's reserved request sentinel so the
         # native planner returns before reading either cache map.
-        planner_req_ids = torch.where(
-            sparse_rows, req_ids_i32, torch.full_like(req_ids_i32, self.size)
-        )
-        planner_topk_ids = torch.where(
-            sparse_rows.unsqueeze(1),
-            topk_src_ids_i32,
-            torch.full_like(topk_src_ids_i32, -1),
-        )
         if lim_plan is None:
+            planner_req_ids = torch.where(
+                sparse_rows, req_ids_i32, torch.full_like(req_ids_i32, self.size)
+            )
+            planner_topk_ids = torch.where(
+                sparse_rows.unsqueeze(1),
+                topk_src_ids_i32,
+                torch.full_like(topk_src_ids_i32, -1),
+            )
             self._plan_sparse_kv_cache(
                 self.device_slot_map[layer_idx],
                 self.device_slot_owner[layer_idx],
@@ -593,40 +602,59 @@ class SparseKVCacheManager:
                 max_context_len=self.logical_max_context_len,
                 cache_capacity=self.cache_capacity,
             )
+            topk_src = self.planner_topk_src_ids[:batch_size]
+            topk_dst = self.planner_topk_dst_slots[:batch_size]
+            topk_miss_counts = self.planner_topk_miss_counts[:batch_size]
+            miss_src = self.planner_miss_src_ids[:batch_size]
+            miss_dst = self.planner_miss_dst_slots[:batch_size]
+            miss_counts = self.planner_miss_counts[:batch_size]
         else:
             # The anchor LIM plan is authoritative across IndexShare consumers.
-            # Copy its bounded output prefix into the contiguous Copy-SFA ABI
-            # scratch; do not invoke the generic planner a second time.
-            self.planner_topk_src_ids[:batch_size].copy_(
-                lim_plan.source_ids[:, None, :]
-            )
-            self.planner_topk_dst_slots[:batch_size].copy_(
-                lim_plan.device_slots[:, None, :]
-            )
-            self.planner_topk_miss_counts[:batch_size].copy_(lim_plan.topk_misses)
-            self.planner_miss_src_ids[:batch_size].copy_(
-                lim_plan.miss_sources[:batch_size, : self.cache_capacity]
-            )
-            self.planner_miss_dst_slots[:batch_size].copy_(
-                lim_plan.miss_slots[:batch_size, : self.cache_capacity]
-            )
-            self.planner_miss_counts[:batch_size].copy_(lim_plan.miss_counts)
+            # Its output buffers already match the Copy-SFA ABI, so pass them
+            # directly and avoid a second cache-planning pass or six tensor copies.
+            topk_src = lim_plan.source_ids[:batch_size].unsqueeze(1)
+            topk_dst = lim_plan.device_slots[:batch_size].unsqueeze(1)
+            topk_miss_counts = lim_plan.topk_misses[:batch_size]
+            miss_src = lim_plan.miss_sources[:batch_size]
+            miss_dst = lim_plan.miss_slots[:batch_size]
+            miss_counts = lim_plan.miss_counts[:batch_size]
         if policy_metadata is not None:
             dense_or_padding = ~sparse_rows
-            self.planner_topk_src_ids[:batch_size].masked_fill_(
-                dense_or_padding[:, None, None], -1
-            )
-            self.planner_topk_dst_slots[:batch_size].masked_fill_(
-                dense_or_padding[:, None, None], -1
-            )
-            self.planner_topk_miss_counts[:batch_size].masked_fill_(dense_or_padding, 0)
-            self.planner_miss_src_ids[:batch_size].masked_fill_(
-                dense_or_padding[:, None], -1
-            )
-            self.planner_miss_dst_slots[:batch_size].masked_fill_(
-                dense_or_padding[:, None], -1
-            )
-            self.planner_miss_counts[:batch_size].masked_fill_(dense_or_padding, 0)
+            if lim_plan is not None:
+                # The LIM operator selects dense rows too, but Copy-SFA reads
+                # those directly from the host block table. Suppress cache-plan
+                # values in place, including captured padded rows.
+                lim_plan.source_ids[:batch_size].masked_fill_(
+                    dense_or_padding[:, None], -1
+                )
+                lim_plan.device_slots[:batch_size].masked_fill_(
+                    dense_or_padding[:, None], -1
+                )
+                lim_plan.topk_misses[:batch_size].masked_fill_(dense_or_padding, 0)
+                lim_plan.miss_sources[:batch_size].masked_fill_(
+                    dense_or_padding[:, None], -1
+                )
+                lim_plan.miss_slots[:batch_size].masked_fill_(
+                    dense_or_padding[:, None], -1
+                )
+                lim_plan.miss_counts[:batch_size].masked_fill_(dense_or_padding, 0)
+            else:
+                self.planner_topk_src_ids[:batch_size].masked_fill_(
+                    dense_or_padding[:, None, None], -1
+                )
+                self.planner_topk_dst_slots[:batch_size].masked_fill_(
+                    dense_or_padding[:, None, None], -1
+                )
+                self.planner_topk_miss_counts[:batch_size].masked_fill_(
+                    dense_or_padding, 0
+                )
+                self.planner_miss_src_ids[:batch_size].masked_fill_(
+                    dense_or_padding[:, None], -1
+                )
+                self.planner_miss_dst_slots[:batch_size].masked_fill_(
+                    dense_or_padding[:, None], -1
+                )
+                self.planner_miss_counts[:batch_size].masked_fill_(dense_or_padding, 0)
         # Keep dense Q row positions stable; padded K/cache rows have length 0.
         if policy_metadata is None:
             kv_lengths = valid_req.to(torch.int32) * self.cache_capacity
@@ -672,12 +700,12 @@ class SparseKVCacheManager:
             dram_block_table,
         )
         return (
-            self.planner_topk_src_ids[:batch_size],
-            self.planner_topk_dst_slots[:batch_size],
-            self.planner_topk_miss_counts[:batch_size],
-            self.planner_miss_src_ids[:batch_size],
-            self.planner_miss_dst_slots[:batch_size],
-            self.planner_miss_counts[:batch_size],
+            topk_src,
+            topk_dst,
+            topk_miss_counts,
+            miss_src,
+            miss_dst,
+            miss_counts,
             self.planner_actual_seq_lengths_query[:batch_size],
             self.planner_actual_seq_lengths_kv[:batch_size],
             self.planner_num_cache_tokens[:batch_size],

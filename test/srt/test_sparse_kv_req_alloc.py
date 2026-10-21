@@ -1,8 +1,12 @@
 from array import array
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload import (
+    manager as manager_module,
+)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
     SparseKVCacheManager,
 )
@@ -63,6 +67,49 @@ def test_fresh_req_allocation_resets_only_new_sparse_rows(copy_sfa_enabled: bool
             assert torch.equal(
                 manager.device_slot_owner[layer_idx][row], torch.tensor([9, 9])
             )
+
+
+def test_reset_requests_keeps_legacy_fixtures_without_optional_lim_state():
+    pool = make_pool()
+    manager = install_sparse_reset(pool, copy_sfa_enabled=False)
+    row = 2
+    for layer_idx in range(manager.layer_num):
+        manager.device_slot_map[layer_idx][row] = torch.tensor([3, 4])
+
+    manager.reset_requests([row])
+
+    for layer_idx in range(manager.layer_num):
+        assert torch.equal(
+            manager.device_slot_map[layer_idx][row], torch.tensor([-1, -1])
+        )
+
+
+def test_copy_sfa_enforces_fixed_cache_capacity_for_reference(monkeypatch):
+    pool = make_pool()
+    monkeypatch.setattr(
+        manager_module,
+        "envs",
+        SimpleNamespace(
+            SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD=SimpleNamespace(get=lambda: True),
+            SGLANG_NPU_ENABLE_COPY_SFA=SimpleNamespace(get=lambda: True),
+            SGLANG_NPU_SPARSE_KV_POLICY=SimpleNamespace(get=lambda: "prefix_tail"),
+            SGLANG_NPU_SPARSE_KV_CACHE_CAPACITY=SimpleNamespace(get=lambda: 4096),
+        ),
+    )
+    monkeypatch.setattr(
+        manager_module, "get_sparse_kv_indexer_impl", lambda: "reference"
+    )
+    monkeypatch.setattr(
+        manager_module.TorchMemorySaverAdapter, "create", lambda **_kwargs: None
+    )
+
+    with pytest.raises(ValueError, match="cache capacity C=2048"):
+        SparseKVCacheManager(
+            pool,
+            None,
+            sparse_context_len=2048,
+            copy_sfa_padded_query_heads=32,
+        )
 
 
 def test_chunk_continuation_reuses_dirty_sparse_row_without_reset():

@@ -28,6 +28,15 @@ class LIMSelection:
     seq_lens: torch.Tensor
 
 
+def _run_native_lim(*args) -> None:
+    """Call the existing wheel wrapper only when the LIM route is active."""
+    from sgl_kernel_npu.sparsity_driven_kv_offload import (
+        fused_lightning_indexer_manage,
+    )
+
+    fused_lightning_indexer_manage(*args)
+
+
 def prepare_lim_rows(seq_lens, request_slots, last_prefix, capacity, request_rows):
     """Derive native states without host scalar reads, including padding/reset."""
     valid = (request_slots > 0) & (request_slots < request_rows) & (seq_lens > 0)
@@ -45,8 +54,8 @@ def prepare_lim_rows(seq_lens, request_slots, last_prefix, capacity, request_row
 
 class LIMDecodeAdapter:
     def __init__(self, manager):
-        self.impl = manager.indexer_impl
-        self.is_native = self.impl == "lim"
+        if manager.indexer_impl != "lim":
+            raise ValueError("LIMDecodeAdapter requires indexer_impl='lim'.")
         self.capacity = manager.device_cache_size
         self.rows = manager.size
         self.batch_capacity = manager.batch_capacity
@@ -85,16 +94,11 @@ class LIMDecodeAdapter:
         key = manager.paged_kv_cache.get_index_k_buffer(manager.start_layer)
         if key.dtype != torch.bfloat16 or manager.store_dtype != torch.bfloat16:
             raise ValueError(
-                "LIM/reference framework integration requires BF16 indexer and "
-                "KV caches."
+                "LIM framework integration requires BF16 indexer and KV caches."
             )
         if key.ndim != 4 or key.shape[1:] != (128, 1, 128):
-            raise ValueError("LIM/reference requires PA index keys [pages,128,1,128].")
-        self.key_scale = (
-            torch.empty(key.shape[:3], dtype=torch.float32, device=device)
-            if self.is_native
-            else None
-        )
+            raise ValueError("LIM requires PA index keys [pages,128,1,128].")
+        self.key_scale = torch.empty(key.shape[:3], dtype=torch.float32, device=device)
 
     def reset_requests(self, request_slots):
         self.last_prefix[:, request_slots] = -1
@@ -109,7 +113,6 @@ class LIMDecodeAdapter:
         block_table,
         forward_batch,
         layer_id,
-        reference_indexer=None,
     ):
         batch = query.shape[0]
         if (
@@ -139,61 +142,37 @@ class LIMDecodeAdapter:
         table.zero_()
         table[:, : block_table.shape[1]].copy_(block_table)
         sources = self.source_ids[:batch]
-        if self.is_native:
-            # Keep the optional NPU package out of CPU-only imports so the
-            # state and graph-buffer contract can be covered by host tests.
-            from sgl_kernel_npu.sparsity_driven_kv_offload import (
-                fused_lightning_indexer_manage,
-            )
-
-            # [:, :heads] would be strided for H32; view a contiguous prefix.
-            scale = self.query_scale.view(-1)[: batch * query.shape[1]].view(
-                batch, query.shape[1]
-            )
-            sources.fill_(-1)
-            self.device_slots[:batch].fill_(-1)
-            self.topk_misses[:batch].zero_()
-            self.miss_sources[:batch].fill_(-1)
-            self.miss_slots[:batch].fill_(-1)
-            self.miss_counts[:batch].zero_()
-            fused_lightning_indexer_manage(
-                weights.contiguous(),
-                scale,
-                query.contiguous(),
-                self.key_scale,
-                key,
-                table,
-                self.query_ends[:batch],
-                lengths,
-                prefix,
-                torch.where(sparse, self.capacity, 0).to(torch.int32),
-                state,
-                slots,
-                manager.lim_slot_map[layer_index],
-                sources,
-                self.device_slots[:batch],
-                self.topk_misses[:batch],
-                self.miss_sources[:batch],
-                self.miss_slots[:batch],
-                self.miss_counts[:batch],
-            )
-        else:
-            result = reference_indexer(
-                query=query.contiguous(),
-                key=key,
-                weights=weights.contiguous(),
-                actual_seq_lengths_query=self.query_ends[:batch],
-                actual_seq_lengths_key=torch.where(
-                    sparse, prefix, lengths.clamp(min=1)
-                ),
-                block_table=table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=self.top_k,
-                sparse_mode=3,
-            )
-            indices = result[0] if isinstance(result, (tuple, list)) else result
-            sources.copy_(indices.view(batch, 1, self.top_k))
+        # [:, :heads] would be strided for H32; view a contiguous prefix.
+        scale = self.query_scale.view(-1)[: batch * query.shape[1]].view(
+            batch, query.shape[1]
+        )
+        sources.fill_(-1)
+        self.device_slots[:batch].fill_(-1)
+        self.topk_misses[:batch].zero_()
+        self.miss_sources[:batch].fill_(-1)
+        self.miss_slots[:batch].fill_(-1)
+        self.miss_counts[:batch].zero_()
+        _run_native_lim(
+            weights.contiguous(),
+            scale,
+            query.contiguous(),
+            self.key_scale,
+            key,
+            table,
+            self.query_ends[:batch],
+            lengths,
+            prefix,
+            torch.where(sparse, self.capacity, 0).to(torch.int32),
+            state,
+            slots,
+            manager.lim_slot_map[layer_index],
+            sources,
+            self.device_slots[:batch],
+            self.topk_misses[:batch],
+            self.miss_sources[:batch],
+            self.miss_slots[:batch],
+            self.miss_counts[:batch],
+        )
         # The native invalid-query fast path can leave reused output rows
         # untouched during graph replay. Never publish a previous request's IDs.
         sources.masked_fill_(~valid[:, None, None], -1)
@@ -211,4 +190,3 @@ class LIMDecodeAdapter:
             slots,
             lengths,
         )
-

@@ -1,13 +1,19 @@
 from types import SimpleNamespace
 
-import torch
 import pytest
+import torch
+
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload import lim as lim_module
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables import (
     fill_request_block_table,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.copy_sfa_buffers import (
     copy_sfa_host_row_stride,
     view_copy_sfa_output,
+)
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.lim import (
+    LIMDecodeAdapter,
+    prepare_lim_rows,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.prefix_tail import (
     derive_prefix_tail_metadata,
@@ -16,10 +22,6 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.prefix_tail impo
     resident_tail_write_mask,
     sparse_batch_capacity,
     valid_sparse_request_rows,
-)
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.lim import (
-    LIMDecodeAdapter,
-    prepare_lim_rows,
 )
 
 
@@ -235,37 +237,36 @@ def test_lim_rows_prepare_cold_warm_dense_and_padding_states():
     )
 
 
-def _make_reference_lim_adapter(batch_capacity=3, top_k=4):
+def _make_lim_adapter(batch_capacity=3, top_k=4):
     adapter = LIMDecodeAdapter.__new__(LIMDecodeAdapter)
-    adapter.impl = "reference"
-    adapter.is_native = False
     adapter.capacity = 4
     adapter.rows = 3
     adapter.batch_capacity = batch_capacity
     adapter.top_k = top_k
     adapter.source_capacity = 256
-    adapter.width = top_k + 128
     adapter.device = torch.device("cpu")
-    adapter.source_ids = torch.empty(
-        (batch_capacity, 1, top_k), dtype=torch.int32
-    )
+    adapter.source_ids = torch.empty((batch_capacity, 1, top_k), dtype=torch.int32)
     adapter.device_slots = torch.empty_like(adapter.source_ids)
     adapter.topk_misses = torch.empty(batch_capacity, dtype=torch.int32)
-    adapter.miss_sources = torch.empty((batch_capacity, 8), dtype=torch.int32)
+    adapter.miss_sources = torch.empty((batch_capacity, 32768), dtype=torch.int32)
     adapter.miss_slots = torch.empty_like(adapter.miss_sources)
     adapter.miss_counts = torch.empty(batch_capacity, dtype=torch.int32)
     adapter.query_ends = torch.arange(1, batch_capacity + 1, dtype=torch.int32)
     adapter.block_table = torch.empty((batch_capacity, 2), dtype=torch.int32)
     adapter.last_prefix = torch.full((1, adapter.rows + 1), -1, dtype=torch.int32)
+    adapter.query_scale = torch.empty((batch_capacity, 64), dtype=torch.float32)
+    adapter.key_scale = torch.empty((2, 128, 1), dtype=torch.float32)
     return adapter
 
 
-def test_lim_reference_graph_scratch_reuses_storage_and_clears_padded_ids():
-    adapter = _make_reference_lim_adapter()
+def test_lim_graph_scratch_reuses_storage_and_clears_padded_ids(monkeypatch):
+    adapter = _make_lim_adapter()
     manager = SimpleNamespace(
         start_layer=0,
         size=adapter.rows,
-        indexer_impl="reference",
+        indexer_impl="lim",
+        device_cache_size=adapter.capacity,
+        lim_slot_map=[torch.full((adapter.rows + 1, 256), -1, dtype=torch.int32)],
     )
     forward_batch = SimpleNamespace(
         req_pool_indices=torch.tensor([1, 2, 0], dtype=torch.int32),
@@ -277,13 +278,20 @@ def test_lim_reference_graph_scratch_reuses_storage_and_clears_padded_ids():
     block_table = torch.zeros((3, 2), dtype=torch.int32)
     pointers = (adapter.source_ids.data_ptr(), adapter.block_table.data_ptr())
 
-    def indexer(result):
-        def run(**kwargs):
-            return result
+    output_markers = iter((1, 11))
 
-        return run
+    def fake_native(*args):
+        marker = next(output_markers)
+        assert args[13].shape == (3, 1, 4) and args[13].is_contiguous()
+        assert args[16].shape == (3, 32768) and args[16].is_contiguous()
+        args[13].fill_(marker)
+        args[14].fill_(marker + 1)
+        args[15].fill_(marker + 2)
+        args[16].fill_(marker + 3)
+        args[17].fill_(marker + 4)
+        args[18].fill_(marker + 5)
 
-    first = torch.tensor([[[1, 2, 3, 4]], [[5, 6, 7, 8]], [[9, 9, 9, 9]]])
+    monkeypatch.setattr(lim_module, "_run_native_lim", fake_native)
     plan = adapter.select(
         manager,
         query=query,
@@ -292,14 +300,12 @@ def test_lim_reference_graph_scratch_reuses_storage_and_clears_padded_ids():
         block_table=block_table,
         forward_batch=forward_batch,
         layer_id=0,
-        reference_indexer=indexer(first),
     )
     assert torch.equal(
         plan.source_ids,
-        torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8], [-1, -1, -1, -1]], dtype=torch.int32),
+        torch.tensor([[1] * 4, [1] * 4, [-1] * 4], dtype=torch.int32),
     )
 
-    second = torch.tensor([[[11, 12, 13, 14]], [[15, 16, 17, 18]], [[19, 19, 19, 19]]])
     replay = adapter.select(
         manager,
         query=query,
@@ -308,13 +314,12 @@ def test_lim_reference_graph_scratch_reuses_storage_and_clears_padded_ids():
         block_table=block_table,
         forward_batch=forward_batch,
         layer_id=0,
-        reference_indexer=indexer(second),
     )
     assert (adapter.source_ids.data_ptr(), adapter.block_table.data_ptr()) == pointers
     assert torch.equal(
         replay.source_ids,
         torch.tensor(
-            [[11, 12, 13, 14], [15, 16, 17, 18], [-1, -1, -1, -1]],
+            [[11] * 4, [11] * 4, [-1] * 4],
             dtype=torch.int32,
         ),
     )
@@ -362,7 +367,7 @@ def test_lim_copy_sfa_reuses_anchor_plan_with_layer_local_kv_and_fresh_sources(
     manager.planner_topk_dst_slots = torch.full_like(manager.planner_topk_src_ids, -1)
     manager.planner_topk_miss_counts = torch.zeros(batch_size, dtype=torch.int32)
     manager.planner_miss_src_ids = torch.full(
-        (batch_size, cache_capacity), -1, dtype=torch.int32
+        (batch_size, 32768), -1, dtype=torch.int32
     )
     manager.planner_miss_dst_slots = torch.full_like(manager.planner_miss_src_ids, -1)
     manager.planner_miss_counts = torch.zeros(batch_size, dtype=torch.int32)
@@ -391,16 +396,16 @@ def test_lim_copy_sfa_reuses_anchor_plan_with_layer_local_kv_and_fresh_sources(
         source_ids=source_ids,
         device_slots=torch.arange(cache_capacity, dtype=torch.int32)
         .view(1, -1)
-        .expand(batch_size, -1),
+        .repeat(batch_size, 1),
         topk_misses=torch.full((batch_size,), cache_capacity, dtype=torch.int32),
-        miss_sources=torch.arange(cache_capacity, dtype=torch.int32)
-        .view(1, -1)
-        .expand(batch_size, -1),
-        miss_slots=torch.arange(cache_capacity, dtype=torch.int32)
-        .view(1, -1)
-        .expand(batch_size, -1),
+        miss_sources=torch.full((batch_size, 32768), -1, dtype=torch.int32),
+        miss_slots=torch.full((batch_size, 32768), -1, dtype=torch.int32),
         miss_counts=torch.full((batch_size,), cache_capacity, dtype=torch.int32),
     )
+    miss_sources = torch.arange(cache_capacity, dtype=torch.int32).repeat(batch_size, 1)
+    miss_slots = torch.arange(cache_capacity, dtype=torch.int32).repeat(batch_size, 1)
+    plan.miss_sources[:, :cache_capacity] = miss_sources
+    plan.miss_slots[:, :cache_capacity] = miss_slots
     req_ids = torch.tensor([1, 0], dtype=torch.int32)
     seq_lens = torch.tensor([2049, 0], dtype=torch.int32)
     forward_batch = SimpleNamespace(
@@ -413,6 +418,12 @@ def test_lim_copy_sfa_reuses_anchor_plan_with_layer_local_kv_and_fresh_sources(
     def fake_copy_sfa(*args):
         cache, topk_src, attention_out = args[2], args[6], args[-2]
         assert torch.count_nonzero(attention_out) == 0
+        assert topk_src.is_contiguous()
+        assert topk_src.data_ptr() == plan.source_ids.data_ptr()
+        assert args[7].data_ptr() == plan.device_slots.data_ptr()
+        assert args[9].data_ptr() == plan.miss_sources.data_ptr()
+        assert args[10].data_ptr() == plan.miss_slots.data_ptr()
+        assert args[11].data_ptr() == plan.miss_counts.data_ptr()
         calls.append((cache.data_ptr(), args[14], topk_src.clone()))
         attention_out[0].fill_(len(calls))
 
