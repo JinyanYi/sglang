@@ -30,6 +30,54 @@ def _make_backend():
 
 
 class TestNPUCudaGraphBackend(unittest.TestCase):
+    def test_copy_sfa_legacy_gate_rejects_mixed_context_and_missing_lengths(self):
+        backend, _ = _make_backend()
+        shape_key = ShapeKey(size=4)
+        backend._graphs[shape_key] = mock.Mock()
+        backend._outputs[shape_key] = "output"
+        decode_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_decode=lambda: True),
+            seq_lens_cpu=torch.tensor([0, 128, 2048, 4096]),
+        )
+
+        with (
+            mock.patch.object(
+                mod.envs.SGLANG_NPU_ENABLE_COPY_SFA, "get", return_value=True
+            ),
+            mock.patch.object(
+                mod.envs.SGLANG_NPU_SPARSE_KV_POLICY, "get", return_value="legacy"
+            ),
+        ):
+            self.assertFalse(backend.can_run(decode_batch, shape_key))
+            decode_batch.seq_lens_cpu = None
+            self.assertFalse(backend.can_run(decode_batch, shape_key))
+
+    def test_prefix_tail_replays_captured_mixed_context_and_missing_length_batches(
+        self,
+    ):
+        backend, _ = _make_backend()
+        shape_key = ShapeKey(size=4)
+        backend._graphs[shape_key] = mock.Mock()
+        backend._outputs[shape_key] = "output"
+        decode_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_decode=lambda: True),
+            seq_lens_cpu=torch.tensor([0, 128, 2048, 4096]),
+        )
+
+        with (
+            mock.patch.object(
+                mod.envs.SGLANG_NPU_ENABLE_COPY_SFA, "get", return_value=True
+            ),
+            mock.patch.object(
+                mod.envs.SGLANG_NPU_SPARSE_KV_POLICY,
+                "get",
+                return_value="prefix_tail",
+            ),
+        ):
+            self.assertTrue(backend.can_run(decode_batch, shape_key))
+            decode_batch.seq_lens_cpu = None
+            self.assertTrue(backend.can_run(decode_batch, shape_key))
+
     def test_replay_update_converts_legacy_sequence_lengths_to_int32_tensor(self):
         backend, runner = _make_backend()
         graph = mock.Mock()

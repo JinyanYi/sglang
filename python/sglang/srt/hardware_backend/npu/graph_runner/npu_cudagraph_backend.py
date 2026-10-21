@@ -142,6 +142,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         if (
             envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
             and forward_batch.forward_mode.is_decode()
+            and envs.SGLANG_NPU_SPARSE_KV_POLICY.get().strip().lower() != "prefix_tail"
         ):
             # Copy-SFA v1 uses a fixed 2048-token cache window. Decide from
             # scheduler-owned CPU metadata before graph replay, so short or

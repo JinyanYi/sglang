@@ -46,7 +46,9 @@ def _copy_sfa_decode_eligible(backend, forward_batch, layer, q, topk_indices):
         or getattr(forward_batch, "spec_info", None) is not None
     ):
         return False
-    if not getattr(forward_batch, "sparse_kv_copy_sfa_capture", False):
+    if not manager.prefix_tail_enabled and not getattr(
+        forward_batch, "sparse_kv_copy_sfa_capture", False
+    ):
         seq_lens_cpu = backend.forward_metadata.seq_lens_cpu_int
         if seq_lens_cpu is None:
             return False
@@ -59,8 +61,8 @@ def _copy_sfa_decode_eligible(backend, forward_batch, layer, q, topk_indices):
         and backend.qk_rope_head_dim == 64
         and q.dtype in (torch.bfloat16, torch.float16)
         and normalize_batch_topk_indices(topk_indices).shape[1] == 2048
-        and manager.cache_capacity == 2048
         and manager.sparse_context_len == 2048
+        and manager.cache_capacity >= manager.sparse_context_len
         and q.shape[0] == forward_batch.batch_size
     )
 
@@ -147,8 +149,24 @@ def forward_sparsity_driven_kv_offload(
     elif forward_batch.forward_mode.is_decode() and _copy_sfa_decode_eligible(
         backend, forward_batch, layer, q_nope, topk_indices
     ):
+        if sparse_kv_manager.indexer_impl == "lim":
+            lim_plan = backend.forward_metadata.sparse_kv_lim_plan
+            if lim_plan is None:
+                raise RuntimeError(
+                    "LIM Copy-SFA decode reached attention without an indexer plan."
+                )
+            # IndexShare consumers use the anchor's selected token IDs, while
+            # copy_sfa_decode still materializes their own layer's KV payload.
+            topk_indices = lim_plan.source_ids
+        sparse_kv_manager.last_decode_path = "copy_sfa"
+        forward_batch.sparse_kv_decode_path = "copy_sfa"
         batch_size = forward_batch.batch_size
         padded_query_heads = q_nope.numel() // (batch_size * backend.kv_lora_rank)
+        lim_plan = (
+            backend.forward_metadata.sparse_kv_lim_plan
+            if sparse_kv_manager.indexer_impl == "lim"
+            else None
+        )
         attn_out = sparse_kv_manager.copy_sfa_decode(
             layer,
             forward_batch,
@@ -157,8 +175,15 @@ def forward_sparsity_driven_kv_offload(
             layer.tp_q_head_num,
             layer.scaling,
             topk_indices,
+            lim_plan=lim_plan,
         )
     elif forward_batch.forward_mode.is_decode():
+        sparse_kv_manager.last_decode_path = (
+            "prefix_tail_reference"
+            if sparse_kv_manager.prefix_tail_enabled
+            else "legacy_reference"
+        )
+        forward_batch.sparse_kv_decode_path = sparse_kv_manager.last_decode_path
         batch_size = forward_batch.batch_size
         num_kv_heads = layer.tp_k_head_num
         num_query_heads = layer.tp_q_head_num
@@ -167,7 +192,7 @@ def forward_sparsity_driven_kv_offload(
 
         topk_2d_input = normalize_batch_topk_indices(topk_indices)
         effective_topk_length = topk_2d_input.shape[1]
-        selected_kv_length = sparse_kv_manager.sparse_context_len
+        selected_kv_length = sparse_kv_manager.selected_kv_width
         if effective_topk_length <= 0:
             raise RuntimeError("SFA BSND compact path expects a positive top-k length.")
         if effective_topk_length > selected_kv_length:
@@ -204,38 +229,81 @@ def forward_sparsity_driven_kv_offload(
         # device-cache hits and host misses are copied into this buffer, the
         # device cache is refilled from it, and sparse attention consumes it
         # directly.
-        selected_kv_buffer = torch.zeros(
-            (
-                batch_size,
-                selected_kv_length,
-                num_kv_heads,
-                nope_head_dim + rope_head_dim,
-            ),
-            dtype=k.dtype,
-            device=backend.device,
-        )
+        if sparse_kv_manager.prefix_tail_enabled:
+            selected_kv_buffer = sparse_kv_manager.selected_kv_buffer[
+                layer.layer_id - sparse_kv_manager.start_layer
+            ][:batch_size]
+            selected_kv_buffer.zero_()
+        else:
+            selected_kv_buffer = torch.zeros(
+                (
+                    batch_size,
+                    selected_kv_length,
+                    num_kv_heads,
+                    nope_head_dim + rope_head_dim,
+                ),
+                dtype=k.dtype,
+                device=backend.device,
+            )
         sparse_kv_manager.materialize_selected_kv(
             layer, forward_batch, topk_indices, selected_kv_buffer, stream
         )
 
         _wait_stream_event(stream, sparse_kv_manager.hit_done)
         _wait_stream_event(stream, sparse_kv_manager.miss_done)
+        prefix_tail_metadata = None
+        if sparse_kv_manager.prefix_tail_enabled:
+            prefix_tail_metadata = sparse_kv_manager.make_prefix_tail_metadata(
+                forward_batch.seq_lens[:batch_size]
+            )
+            sparse_kv_manager.materialize_dense_prefix(
+                layer,
+                forward_batch.req_pool_indices[:batch_size],
+                forward_batch.seq_lens[:batch_size],
+                prefix_tail_metadata,
+                selected_kv_buffer,
+                stream,
+            )
+            sparse_kv_manager.append_prefix_tail(
+                layer,
+                forward_batch.req_pool_indices[:batch_size],
+                prefix_tail_metadata,
+                selected_kv_buffer,
+                stream,
+            )
 
         selected_k_nope, selected_k_rope = selected_kv_buffer.split(
             [nope_head_dim, rope_head_dim], dim=-1
         )
 
-        topk_valid = topk_2d >= 0
+        topk_valid = (topk_2d >= 0) & (
+            topk_2d < sparse_kv_manager.logical_max_context_len
+        )
         if forward_batch.seq_lens is not None:
             valid_rows = (forward_batch.seq_lens[:batch_size] > 0).view(batch_size, 1)
             topk_valid = topk_valid & valid_rows
+        if prefix_tail_metadata is not None:
+            topk_valid = topk_valid & (
+                topk_2d < prefix_tail_metadata.indexer_seq_lens[:, None]
+            )
 
-        actual_seq_lengths_kv = (
-            topk_valid.sum(dim=1)
-            .clamp(min=1, max=selected_kv_length)
-            .to(device=q_nope.device, dtype=torch.int32)
-            .contiguous()
+        selected_topk_counts = topk_valid.sum(dim=1).to(
+            device=q_nope.device, dtype=torch.int32
         )
+        if prefix_tail_metadata is None:
+            actual_seq_lengths_kv = selected_topk_counts.clamp(
+                min=1, max=selected_kv_length
+            ).contiguous()
+        else:
+            actual_seq_lengths_kv = (
+                torch.where(
+                    prefix_tail_metadata.sparse_rows,
+                    selected_topk_counts + prefix_tail_metadata.tail_lens,
+                    forward_batch.seq_lens[:batch_size].to(torch.int32),
+                )
+                .clamp(min=1, max=selected_kv_length)
+                .contiguous()
+            )
         actual_seq_lengths_query = torch.ones(
             batch_size, dtype=torch.int32, device=q_nope.device
         ).contiguous()
@@ -254,6 +322,45 @@ def forward_sparsity_driven_kv_offload(
             compact_indices,
             torch.full_like(compact_indices, -1),
         ).contiguous()
+
+        if prefix_tail_metadata is not None:
+            tail_offsets = torch.arange(
+                selected_kv_length - sparse_kv_manager.sparse_context_len,
+                device=q_nope.device,
+                dtype=torch.int32,
+            )
+            tail_valid = prefix_tail_metadata.sparse_rows[:, None] & (
+                tail_offsets[None, :] < prefix_tail_metadata.tail_lens[:, None]
+            )
+            tail_slots = (
+                (sparse_kv_manager.sparse_context_len + tail_offsets)
+                .view(1, 1, 1, -1)
+                .expand(batch_size, 1, num_kv_heads, -1)
+            )
+            sparse_indices[:, :, :, sparse_kv_manager.sparse_context_len :] = (
+                torch.where(
+                    tail_valid[:, None, None, :].expand_as(tail_slots),
+                    tail_slots,
+                    torch.full_like(tail_slots, -1),
+                )
+            )
+            dense_offsets = torch.arange(
+                selected_kv_length, device=q_nope.device, dtype=torch.int32
+            )
+            dense_slots = dense_offsets.view(1, 1, 1, -1).expand_as(sparse_indices)
+            dense_valid = (
+                dense_offsets[None, :] < forward_batch.seq_lens[:batch_size, None]
+            )
+            dense_indices = torch.where(
+                dense_valid[:, None, None, :].expand_as(sparse_indices),
+                dense_slots,
+                torch.full_like(sparse_indices, -1),
+            )
+            sparse_indices = torch.where(
+                (~prefix_tail_metadata.sparse_rows)[:, None, None, None],
+                dense_indices,
+                sparse_indices,
+            )
 
         empty_rows = (topk_valid.sum(dim=1) == 0).view(batch_size, 1, 1)
         sparse_indices[:, :, :, 0] = torch.where(

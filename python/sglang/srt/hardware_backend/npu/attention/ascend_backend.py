@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
+    get_exec,
     get_flags,
     get_parallel,
     get_spec,
@@ -125,6 +126,8 @@ class ForwardMetadata:
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
+    # Q1 LIM selection plan reused by IndexShare attention layers in this forward.
+    sparse_kv_lim_plan: Optional[object] = None
 
 
 class AscendAttnMaskBuilder:
@@ -381,6 +384,25 @@ class AscendAttnBackend(AttentionBackend):
                 SparseKVCacheManager,
                 register_sparse_kv_manager,
             )
+            from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+                get_batch_sizes_to_capture,
+            )
+
+            graph_batch_capacity = model_runner.req_to_token_pool.size
+            graph_config = get_exec().graph.cuda_graph_config
+            decode_graph_config = (
+                getattr(graph_config, "decode", None)
+                if graph_config is not None
+                else None
+            )
+            if (
+                not get_exec().graph.disable_cuda_graph
+                and decode_graph_config is not None
+                and decode_graph_config.bs
+            ):
+                capture_bs, _ = get_batch_sizes_to_capture(model_runner)
+                if capture_bs:
+                    graph_batch_capacity = max(capture_bs)
 
             self.sparse_kv_manager = SparseKVCacheManager(
                 model_runner.req_to_token_pool,
@@ -402,6 +424,7 @@ class AscendAttnBackend(AttentionBackend):
                     if envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
                     else None
                 ),
+                graph_batch_capacity=graph_batch_capacity,
             )
             register_sparse_kv_manager(self.sparse_kv_manager)
             logger.info(

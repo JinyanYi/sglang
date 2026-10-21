@@ -1061,6 +1061,9 @@ class Envs:
     SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
     SGLANG_NPU_ENABLE_COPY_SFA = EnvBool(False)
+    SGLANG_NPU_SPARSE_KV_POLICY = EnvStr("legacy")
+    SGLANG_NPU_SPARSE_KV_CACHE_CAPACITY = EnvInt(None)
+    SGLANG_NPU_SPARSE_KV_INDEXER = EnvStr("reference")
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
     # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
     SGLANG_NPU_USE_FIAS_V2_BSND = EnvBool(False)

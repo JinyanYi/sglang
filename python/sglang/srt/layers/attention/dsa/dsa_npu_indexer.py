@@ -288,6 +288,15 @@ class DSANPUIndexerMixin:
         if _use_ag_after_qlora and input_on_attn_tp_slices:
             weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = get_attn_backend().forward_metadata.block_tables
+        sparse_kv_manager = getattr(get_attn_backend(), "sparse_kv_manager", None)
+        if (
+            not is_prefill
+            and sparse_kv_manager is not None
+            and sparse_kv_manager.prefix_tail_enabled
+        ):
+            actual_seq_lengths_kv = sparse_kv_manager.make_prefix_tail_metadata(
+                forward_batch.seq_lens
+            ).indexer_seq_lens
         if (
             is_prefill
             and self.dsa_enable_prefill_cp
@@ -308,6 +317,25 @@ class DSANPUIndexerMixin:
                 if is_prefill
                 else block_table
             )
+
+            if (
+                not is_prefill
+                and sparse_kv_manager is not None
+                and sparse_kv_manager.indexer_impl == "lim"
+            ):
+                if q.shape[0] != forward_batch.batch_size:
+                    raise ValueError("LIM indexer currently requires Q1 decode.")
+                plan = sparse_kv_manager.lim_adapter.select(
+                    sparse_kv_manager,
+                    query=q.view(-1, self.n_heads, self.head_dim),
+                    weights=weights,
+                    key=past_key_states,
+                    block_table=block_table,
+                    forward_batch=forward_batch,
+                    layer_id=layer_id,
+                )
+                attn_backend.forward_metadata.sparse_kv_lim_plan = plan
+                return plan.source_ids
 
             if use_quant_indexer:
                 query, query_scale = _quantize_npu_indexer_activation(
