@@ -287,23 +287,21 @@ class SparseKVCacheManager:
                     )
                     for _ in range(self.layer_num)
                 ]
-                self.selected_kv_buffer: Optional[list[torch.Tensor]] = (
-                    [
-                        torch.empty(
-                            (
-                                self.batch_capacity,
-                                self.selected_kv_width,
-                                self.head_num,
-                                self.head_dim,
-                            ),
-                            dtype=self.store_dtype,
-                            device=self.device,
-                        )
-                        for _ in range(self.layer_num)
-                    ]
-                    if self.prefix_tail_enabled
-                    else None
-                )
+                self.selected_kv_buffer: Optional[list[torch.Tensor]] = None
+                if self.prefix_tail_enabled:
+                    # The attention path joins all helper streams before the
+                    # next layer, so one graph-stable batch workspace suffices.
+                    selected_workspace = torch.empty(
+                        (
+                            self.batch_capacity,
+                            self.selected_kv_width,
+                            self.head_num,
+                            self.head_dim,
+                        ),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    self.selected_kv_buffer = [selected_workspace] * self.layer_num
         except Exception as e:
             self._raise_buffer_allocation_error("device_kv_buffer", e)
 
