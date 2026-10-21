@@ -366,7 +366,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     element_size=kv_size,
                 )
                 if offload_cell_size is not None:
-                    return offload_cell_size
+                    # Keep the offload helper's validation above, but charge
+                    # the same compact owner-layer index-K layout that the
+                    # NPU pool allocator creates.
+                    indexer_cell_size = self._compute_dsa_indexer_cell_size(
+                        kvc=kvc,
+                        num_layers=num_layers,
+                    )
+                    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                        get_sparse_kv_indexer_impl,
+                    )
+
+                    if get_sparse_kv_indexer_impl() == "lim":
+                        # LIM owns one shared FP32 key-scale value per token.
+                        indexer_cell_size += 4
+                    return indexer_cell_size
 
             from sglang.srt.mem_cache.kv_cache_configurator import (
                 calculate_mla_kv_cache_dim,

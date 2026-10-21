@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.page_interleave import (
     compute_page_shard_scratch_bytes,
     make_page_shard_spec,
@@ -1084,6 +1085,39 @@ class TestEagleConfigurator(CustomTestCase):
 
 
 class TestDSAIndexerAllocationPolicy(CustomTestCase):
+    @patch("sglang.srt.model_executor.pool_configurator._is_npu", True)
+    @patch(
+        "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
+        return_value=True,
+    )
+    @patch(
+        "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.attention_backends",
+        return_value=("ascend", "ascend"),
+    )
+    def test_lim_offload_budget_includes_one_shared_key_scale(
+        self, _mock_attention_backends, _mock_is_npu
+    ):
+        num_layers = 78
+        mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+        _configure_dsa_model(mr)
+        mr.model_config.hf_config.indexer_types = ["full"] * 21 + ["shared"] * 57
+
+        with (
+            mock_cpu_env(kv_size=2),
+            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+            envs.SGLANG_NPU_ENABLE_COPY_SFA.override(True),
+            envs.SGLANG_NPU_SPARSE_KV_POLICY.override("prefix_tail"),
+            envs.SGLANG_NPU_SPARSE_KV_INDEXER.override("lim"),
+            get_schedule().override(max_running_requests=8, page_size=128),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            configurator = DefaultPoolConfigurator(mr)
+
+        self.assertEqual(configurator._cell_size, 128 * 21 * 2 + 4)
+
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
