@@ -38,6 +38,7 @@ def _lim_copy_sfa_metadata_kernel(
     HOST_S0: tl.constexpr,
     HOST_S1: tl.constexpr,
     TAIL_MODE: tl.constexpr,
+    PACKED_C8: tl.constexpr,
 ):
     tile_id = tl.program_id(0).to(tl.int32)
     row_id = tl.program_id(1).to(tl.int32)
@@ -105,6 +106,9 @@ def _lim_copy_sfa_metadata_kernel(
                 + tl.load(tail_seq_lens_ptr + row_id)
                 - tl.load(next_prefix_ptr + row_id)
             )
+        if PACKED_C8:
+            cache_length = tl.where(active, logical_length, 0).to(tl.int32)
+            logical_length = tl.load(tail_seq_lens_ptr + row_id)
         tl.store(
             actual_seq_lengths_kv_ptr + row_id,
             tl.where(active, logical_length, 0).to(tl.int32),
@@ -166,6 +170,7 @@ def fused_lim_copy_sfa_metadata(
     host_block_table: torch.Tensor | None = None,
     tail_seq_lens: torch.Tensor | None = None,
     tail_tokens: int = 0,
+    packed_c8: bool = False,
 ) -> None:
     """Update preallocated LIM / Copy-SFA metadata in one NPU kernel launch.
 
@@ -229,6 +234,8 @@ def fused_lim_copy_sfa_metadata(
         raise ValueError("all per-row metadata tensors must have shape [B].")
     if last_prefix.ndim != 1 or last_prefix.shape[0] != request_rows + 1:
         raise ValueError("last_prefix must have shape [request_rows + 1].")
+    if packed_c8 and (tail_tokens != 256 or tail_seq_lens is None):
+        raise ValueError("A5 C8 metadata needs real sequence lengths and256 tail slots")
     if tail_tokens not in (0, 256):
         raise ValueError("tail_tokens must be0 or256")
     if tail_seq_lens is not None and (
@@ -325,6 +332,7 @@ def fused_lim_copy_sfa_metadata(
         host_block_table.stride(0) if host_block_table is not None else 0,
         host_block_table.stride(1) if host_block_table is not None else 0,
         tail_seq_lens is not None,
+        packed_c8,
     )
 
 

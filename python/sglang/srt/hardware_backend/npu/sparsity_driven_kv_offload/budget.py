@@ -50,6 +50,7 @@ def resolve_sparse_kv_budget(
     fused_pre_metadata: bool = False,
     graph_batch_capacity: int = 0,
     device_tail_tokens: int = 0,
+    packed_c8: bool = False,
 ) -> SparseKVBudget:
     """Size persistent manager allocations, including padding and one workspace.
 
@@ -83,6 +84,17 @@ def resolve_sparse_kv_budget(
         raise ValueError(
             "A separate HBM tail requires native LIM/CopySFA and256 slots."
         )
+    if packed_c8:
+        if not copy_sfa or indexer_impl != "lim" or kv_bytes_per_token != 656:
+            raise ValueError("A5 C8 requires native LIM/CopySFA and 656-byte KV")
+        if device_tail_tokens != 256 or context_len > 262144:
+            raise ValueError(
+                "A5 C8 requires 256 tail slots and at most 262144 source tokens"
+            )
+        if copy_sfa_query_heads not in (8, 16, 32, 64, 128):
+            raise ValueError("A5 C8 query heads must be 8,16,32,64,128")
+        if cache_tokens > 32384:
+            raise ValueError("A5 C8 capacity must be <=32384 with its tail reserve")
     if copy_sfa:
         if top_k != 2048 or (
             cache_tokens != 0
@@ -140,7 +152,11 @@ def resolve_sparse_kv_budget(
         adapter_bytes += batch_rows * 4 * (2 * top_k * 4 + 4 + 64 * 4)
         adapter_bytes += batch_rows * 4
         mtp_output_bytes = (
-            batch_rows * 4 * copy_sfa_query_heads * 512 * (kv_bytes_per_token // 576)
+            batch_rows
+            * 4
+            * copy_sfa_query_heads
+            * 512
+            * (2 if packed_c8 else kv_bytes_per_token // 576)
         )
     auto_capacity = cache_tokens == 0
     if auto_capacity and hbm_budget_bytes:
@@ -194,8 +210,17 @@ def resolve_sparse_kv_budget(
             num_layers * (request_rows + 1) * cache_tokens * 4
             + batch_rows * (2 * top_k + 2 * cache_tokens + 5) * 4
             + (batch_rows + 1) * ((cache_tokens + context_len) // 128) * 4
-            + batch_rows * copy_sfa_query_heads * 512 * (kv_bytes_per_token // 576)
+            + batch_rows
+            * copy_sfa_query_heads
+            * 512
+            * (2 if packed_c8 else kv_bytes_per_token // 576)
         )
+    if packed_c8:
+        # Fixed-address merged Q and Q4 output use compute dtype, never INT8.
+        copy_sfa_bytes += batch_rows * 4 * copy_sfa_query_heads * 576 * 2
+        if not mtp_full_visible:
+            copy_sfa_bytes += batch_rows * 4 * copy_sfa_query_heads * 512 * 2
+        adapter_bytes += batch_rows * (8 * 4 + 2)
     result = SparseKVBudget(
         cache_tokens=cache_tokens,
         device_kv_bytes=request_rows

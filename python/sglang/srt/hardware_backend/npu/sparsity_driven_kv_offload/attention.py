@@ -211,6 +211,22 @@ def forward_sparsity_driven_kv_offload(
     topk_indices: Optional[torch.Tensor] = None,
 ):
     """Run sparse attention using host-offloaded compact MLA KV."""
+    if getattr(backend.sparse_kv_manager, "packed_c8", False):
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.c8 import (
+            forward_c8_offload,
+        )
+
+        return forward_c8_offload(
+            backend,
+            q,
+            k,
+            layer,
+            forward_batch,
+            save_kv_cache,
+            q_rope,
+            k_rope,
+            topk_indices,
+        )
     del v
     if q_rope is None or k_rope is None or topk_indices is None:
         raise ValueError(

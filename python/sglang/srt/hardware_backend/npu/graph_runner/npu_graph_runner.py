@@ -104,12 +104,20 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         # The generic padded-batch path does not call backend.can_run(). Apply
         # the fixed-window requirement before either padded or exact replay.
         if (
-            forward_batch.forward_mode.is_decode()
-            or (
-                envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
-                and forward_batch.forward_mode.is_target_verify()
+            not self.model_runner.is_draft_worker
+            and (
+                forward_batch.forward_mode.is_decode()
+                or (
+                    (
+                        envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
+                        or envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get()
+                        or self.model_runner.kv_cache_dtype == torch.float8_e4m3fn
+                    )
+                    and forward_batch.forward_mode.is_target_verify()
+                )
             )
-        ) and not is_copy_sfa_decode_graph_eligible(forward_batch.seq_lens_cpu):
+            and not is_copy_sfa_decode_graph_eligible(forward_batch.seq_lens_cpu)
+        ):
             return False
         return super().can_run_graph(forward_batch)
 

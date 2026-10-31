@@ -334,16 +334,29 @@ class DSANPUIndexerMixin:
                 )
 
                 if use_native_mtp_verify(backend, forward_batch, manager):
+                    lim_query = q.view(-1, self.n_heads, self.head_dim)
+                    quant_args = {}
                     if use_quant_indexer:
-                        raise ValueError("Native MTP LIM requires BF16 index keys.")
+                        if not getattr(manager, "packed_c8", False):
+                            raise ValueError(
+                                "Quantized target LIM requires the A5 C8 bridge"
+                            )
+                        lim_query, query_scale = _quantize_npu_indexer_activation(
+                            lim_query, pool.indexer_hadamard_128, pool.dtype
+                        )
+                        quant_args = dict(
+                            query_scale=query_scale,
+                            key_scale=pool.get_index_k_scale_buffer(layer_id),
+                        )
                     plan = manager.lim_adapter.select_mtp(
                         manager,
-                        query=q.view(-1, self.n_heads, self.head_dim),
+                        query=lim_query,
                         weights=weights,
                         key=past_key_states,
                         block_table=block_table,
                         forward_batch=forward_batch,
                         layer_id=layer_id,
+                        **quant_args,
                     )
                     backend.forward_metadata.sparse_kv_lim_plan = plan
                     return plan.source_ids
@@ -354,19 +367,30 @@ class DSANPUIndexerMixin:
                 and manager is not None
                 and manager.lim_adapter is not None
             ):
+                lim_query = q.view(-1, self.n_heads, self.head_dim)
+                quant_args = {}
                 if use_quant_indexer:
-                    raise ValueError(
-                        "LIM/reference decode does not support quantized index keys."
+                    if not getattr(manager, "packed_c8", False):
+                        raise ValueError(
+                            "Quantized target LIM requires the A5 C8 bridge"
+                        )
+                    lim_query, query_scale = _quantize_npu_indexer_activation(
+                        lim_query, pool.indexer_hadamard_128, pool.dtype
+                    )
+                    quant_args = dict(
+                        query_scale=query_scale,
+                        key_scale=pool.get_index_k_scale_buffer(layer_id),
                     )
                 plan = manager.lim_adapter.select(
                     manager,
-                    query=q.view(-1, self.n_heads, self.head_dim),
+                    query=lim_query,
                     weights=weights,
                     key=past_key_states,
                     block_table=block_table,
                     forward_batch=forward_batch,
                     layer_id=layer_id,
                     reference_indexer=torch_npu.npu_lightning_indexer,
+                    **quant_args,
                 )
                 backend.forward_metadata.sparse_kv_lim_plan = plan
                 return plan.source_ids

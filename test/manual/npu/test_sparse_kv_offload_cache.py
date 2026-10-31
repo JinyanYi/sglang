@@ -287,6 +287,7 @@ class TestSparseKVManager(unittest.TestCase):
         m = self.Manager.__new__(self.Manager)
         m.lim_adapter = None
         m.copy_sfa_enabled = False
+        m.packed_c8 = False
         m.separate_mtp_tail = False
         m.size, m.max_context_len, m.sparse_context_len = 4, 64, 2
         m.device_cache_size, m.use_lru = capacity, capacity > 2
@@ -415,6 +416,21 @@ class TestSparseKVManager(unittest.TestCase):
         actual = manager.host_kv_buffer[0].view(-1, 1, 3)
         expected = before.view(-1, 1, 3)
         torch.testing.assert_close(actual[[41, 42, 40]], expected[[40, 41, 42]])
+
+    def test_c8_accepted_move_preserves_payload_rope_and_scale_bytes(self):
+        manager = self.manager()
+        manager.host_kv_is_paged = True
+        manager.head_num, manager.head_dim = 1, 656
+        manager.store_dtype = torch.int8
+        manager.host_kv_buffer = [
+            torch.arange(64 * 656).to(torch.int8).view(1, 64, 1, 656)
+        ]
+        before = manager.host_kv_buffer[0].clone()
+        manager.move_host_kv(torch.tensor([41, 42, 40]), torch.tensor([40, 41, 42]))
+        actual = manager.host_kv_buffer[0].view(-1, 656)
+        original = before.view(-1, 656)
+        self.assertTrue(torch.equal(actual[[41, 42, 40]], original[[40, 41, 42]]))
+        self.assertTrue(torch.equal(actual[:40], original[:40]))
 
     def test_mtp_tp_suffix_cannot_overwrite_committed_position_zero(self):
         manager = self.manager()

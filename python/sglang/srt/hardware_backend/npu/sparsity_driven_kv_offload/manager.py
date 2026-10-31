@@ -107,6 +107,7 @@ class SparseKVCacheManager:
         copy_sfa_padded_query_heads: Optional[int] = None,
         graph_batch_capacity: int = 0,
         paged_kv_cache: Optional[MLATokenToKVPool] = None,
+        compute_dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         enable_memory_saver = False
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -123,9 +124,20 @@ class SparseKVCacheManager:
         self.last_decode_path = "unselected"
         self.logical_max_context_len = int(req_to_token_pool.max_context_len)
         self.copy_sfa_enabled = envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
-        self.separate_mtp_tail = envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get()
+        pool = (
+            paged_kv_cache
+            if paged_kv_cache is not None
+            else token_to_kv_pool_allocator.get_kvcache()
+        )
+        self.packed_c8 = getattr(pool, "dsa_kv_cache_store_fp8", False)
+        self.compute_dtype = compute_dtype
+        self.separate_mtp_tail = (
+            envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get() or self.packed_c8
+        )
         self.tail_tokens = 256 if self.separate_mtp_tail else 0
-        if envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get() or self.separate_mtp_tail:
+        if (
+            envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get() or self.separate_mtp_tail
+        ) and not self.packed_c8:
             from sglang.srt.runtime_context import get_spec
 
             spec = get_spec()
@@ -167,6 +179,9 @@ class SparseKVCacheManager:
             self.paged_kv_cache.kv_lora_rank + self.paged_kv_cache.qk_rope_head_dim
         )
         self.store_dtype = self.paged_kv_cache.store_dtype
+        if self.packed_c8:
+            self.head_dim = 656
+            self.store_dtype = torch.int8
         self.layer_num = self.paged_kv_cache.layer_num
         self.host_token_capacity = (
             (int(paged_kv_cache.size) + int(paged_kv_cache.page_size) + 127) // 128
@@ -179,6 +194,7 @@ class SparseKVCacheManager:
             kv_bytes_per_token=self.head_dim * self.store_dtype.itemsize,
             copy_sfa_query_heads=copy_sfa_padded_query_heads or 128,
             graph_batch_capacity=self.batch_capacity,
+            packed_c8=self.packed_c8,
         )
         self.device_cache_size = self.budget.cache_tokens
         self.device_kv_stride = self.device_cache_size + self.tail_tokens
@@ -225,15 +241,23 @@ class SparseKVCacheManager:
                     "Copy-SFA supports only MLA KV dimensions CKV=512 and KPE=64; "
                     f"got CKV={self.kv_lora_rank}, KPE={self.qk_rope_head_dim}."
                 )
-            if self.store_dtype not in (torch.bfloat16, torch.float16):
+            if not self.packed_c8 and self.store_dtype not in (
+                torch.bfloat16,
+                torch.float16,
+            ):
                 raise ValueError(
                     "Copy-SFA supports only BF16 or FP16 KV storage; "
                     f"got {self.store_dtype}."
                 )
-            from sgl_kernel_npu.sparsity_driven_kv_offload import plan_sparse_kv_cache
+            if self.packed_c8:
+                self._plan_sparse_kv_cache = self._copy_sfa_operator = None
+            else:
+                from sgl_kernel_npu.sparsity_driven_kv_offload import (
+                    plan_sparse_kv_cache,
+                )
 
-            self._plan_sparse_kv_cache = plan_sparse_kv_cache
-            self._copy_sfa_operator = load_copy_sfa_operator()
+                self._plan_sparse_kv_cache = plan_sparse_kv_cache
+                self._copy_sfa_operator = load_copy_sfa_operator()
         else:
             self._plan_sparse_kv_cache = None
             self._copy_sfa_operator = None
@@ -398,6 +422,7 @@ class SparseKVCacheManager:
                     if (
                         envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
                         or self.separate_mtp_tail
+                        or self.packed_c8
                     ):
                         self.mtp_attn_out = torch.empty(
                             (
@@ -405,7 +430,9 @@ class SparseKVCacheManager:
                                 copy_sfa_padded_query_heads,
                                 self.kv_lora_rank,
                             ),
-                            dtype=self.store_dtype,
+                            dtype=self.compute_dtype
+                            if self.packed_c8
+                            else self.store_dtype,
                             device=self.device,
                         )
                     self.planner_attn_out = torch.empty(
@@ -414,7 +441,9 @@ class SparseKVCacheManager:
                             copy_sfa_padded_query_heads,
                             self.kv_lora_rank,
                         ),
-                        dtype=self.store_dtype,
+                        dtype=self.compute_dtype
+                        if self.packed_c8
+                        else self.store_dtype,
                         device=self.device,
                     )
         except Exception as e:
@@ -470,7 +499,20 @@ class SparseKVCacheManager:
                 LIMDecodeAdapter,
             )
 
-            self.lim_adapter = LIMDecodeAdapter(self)
+            if self.packed_c8:
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.c8 import (
+                    C8Cache,
+                )
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.c8_lim_bridge import (
+                    C8LIMBridge,
+                )
+
+                self.lim_adapter = C8LIMBridge(self)
+                self.c8_cache = C8Cache(
+                    self, copy_sfa_padded_query_heads, compute_dtype
+                )
+            else:
+                self.lim_adapter = LIMDecodeAdapter(self)
 
         self._install_req_alloc_hook(req_to_token_pool)
 
@@ -1033,7 +1075,13 @@ class SparseKVCacheManager:
         # k:         [num_new_tokens, nhead, kv_lora_rank]
         # k_rope:    [num_new_tokens, nhead, qk_rope_head_dim]
         # kv_device: [num_new_tokens, nhead, kv_lora_rank + qk_rope_head_dim]
-        src_tensor = torch.cat([k, k_rope], dim=-1).contiguous()
+        src_tensor = (
+            self.paged_kv_cache._pack_dsa_fp8_kv_cache(k, k_rope)
+            .view(torch.int8)
+            .view(-1, 1, 656)
+            if self.packed_c8
+            else torch.cat([k, k_rope], dim=-1).contiguous()
+        )
         dst_tensor = self.host_kv_buffer[layer_idx]
         src_index = torch.arange(src_tensor.shape[0], device=device, dtype=torch.long)
         num_src_rows = int(src_tensor.shape[0])
@@ -1214,9 +1262,9 @@ class SparseKVCacheManager:
                 dst_ptr=self.dev_ptr_list[layer_idx],
             )
 
-            if (
-                getattr(self, "separate_mtp_tail", False)
-                and forward_batch.forward_mode.is_target_verify()
+            if getattr(self, "separate_mtp_tail", False) and (
+                forward_batch.forward_mode.is_target_verify()
+                or (self.packed_c8 and forward_batch.forward_mode.is_decode())
             ):
                 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_mtp_tail import (
                     stage_mtp_tail,
@@ -1235,6 +1283,9 @@ class SparseKVCacheManager:
                     workspace=self.tail_workspace,
                     capacity=self.cache_capacity,
                     context_len=self.logical_max_context_len,
+                    query_width=4
+                    if forward_batch.forward_mode.is_target_verify()
+                    else 1,
                 )
 
     def get_forward_kv(

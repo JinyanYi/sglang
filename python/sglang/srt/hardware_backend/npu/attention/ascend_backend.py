@@ -402,7 +402,11 @@ class AscendAttnBackend(AttentionBackend):
                     next(
                         (
                             padding
-                            for padding in (1, 2, 4, 8, 16, 32, 64, 128)
+                            for padding in (
+                                (8, 16, 32, 64, 128)
+                                if model_runner.kv_cache_dtype == torch.float8_e4m3fn
+                                else (1, 2, 4, 8, 16, 32, 64, 128)
+                            )
                             if padding
                             >= model_runner.model_config.num_attention_heads
                             // get_parallel().attn_tp_size
@@ -414,6 +418,7 @@ class AscendAttnBackend(AttentionBackend):
                 ),
                 graph_batch_capacity=graph_batch_capacity,
                 paged_kv_cache=self.token_to_kv_pool,
+                compute_dtype=model_runner.dtype,
             )
             self.token_to_kv_pool.sparse_kv_manager = self.sparse_kv_manager
             register_sparse_kv_manager(self.sparse_kv_manager)

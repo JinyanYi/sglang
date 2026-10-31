@@ -17,7 +17,9 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.budget import (
 )
 from sglang.srt.runtime_context import (
     attention_backends,
+    get_disagg,
     get_exec,
+    get_model,
     get_parallel,
     get_schedule,
     get_spec,
@@ -41,6 +43,8 @@ def is_copy_sfa_decode_graph_eligible(seq_lens_cpu) -> bool:
     if not envs.SGLANG_NPU_ENABLE_COPY_SFA.get():
         return True
     capacity = envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get() or 2048
+    if get_model().kv_cache_dtype == "fp8_e4m3":
+        capacity += 128
     return seq_lens_cpu is not None and not any(
         0 < int(length) < capacity for length in seq_lens_cpu.tolist()
     )
@@ -112,6 +116,18 @@ def is_sparsity_driven_kv_offload_enabled(
             "Sparse KV MTP requires EAGLE/NEXTN with "
             "--speculative-eagle-topk 1, PP=1 and DCP disabled."
         )
+    if get_model().kv_cache_dtype == "fp8_e4m3":
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        if not is_npu_arch35():
+            raise ValueError("A5 C8 CopySFA requires Ascend950")
+        if indexer_impl != "lim" or not envs.SGLANG_NPU_ENABLE_COPY_SFA.get():
+            raise ValueError("A5 C8 target offload requires native LIM and CopySFA")
+        if (
+            get_parallel().attn_cp_size != 1
+            or get_disagg().disaggregation_mode != "null"
+        ):
+            raise ValueError("A5 C8 integration requires colocated execution and CP=1")
     return True
 
 
@@ -185,6 +201,7 @@ def get_sparse_kv_budget(
     kv_bytes_per_token: int,
     copy_sfa_query_heads: int = 128,
     graph_batch_capacity: Optional[int] = None,
+    packed_c8: bool = False,
 ) -> SparseKVBudget:
     if graph_batch_capacity is None:
         # Reserve before admission determines the final request-pool size.
@@ -211,8 +228,12 @@ def get_sparse_kv_budget(
         mtp_full_visible=(
             envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
             or envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get()
+            or (packed_c8 and get_spec().speculative_num_draft_tokens == 4)
         ),
-        device_tail_tokens=256 if envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get() else 0,
+        device_tail_tokens=256
+        if packed_c8 or envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get()
+        else 0,
+        packed_c8=packed_c8,
         fused_copy_sfa_metadata=envs.SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA.get(),
         fused_pre_metadata=envs.SGLANG_NPU_FUSED_LIM_PRE_METADATA.get(),
         graph_batch_capacity=sparse_batch_capacity(

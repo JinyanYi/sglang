@@ -21,11 +21,12 @@ def _tail_metadata_kernel(
     CONTEXT: tl.constexpr,
     REQUEST_STRIDE: tl.constexpr,
     C: tl.constexpr,
+    Q: tl.constexpr,
 ):
     batch = tl.program_id(0)
     request = tl.load(requests + batch).to(tl.int32)
-    first = tl.load(positions + batch * 4).to(tl.int32)
-    last = tl.load(positions + batch * 4 + 3).to(tl.int32) + 1
+    first = tl.load(positions + batch * Q).to(tl.int32)
+    last = tl.load(positions + batch * Q + Q - 1).to(tl.int32) + 1
     active = (request > 0) & (request < REQUEST_ROWS) & (first >= 0) & (last <= CONTEXT)
     safe = tl.where(active, request, 0)
     prefix = first // 128 * 128
@@ -41,11 +42,11 @@ def _tail_metadata_kernel(
     tl.store(history_src + batch * 128 + offset, physical)
     tl.store(history_dst + batch * 128 + offset, tl.where(restore, dst, 0))
     tl.store(history_valid + batch * 128 + offset, restore)
-    q = tl.arange(0, 4)
+    q = tl.arange(0, Q)
     qpos = first + q
     qdst = safe.to(tl.int64) * (C + 256) + C + qpos % 256
-    tl.store(current_dst + batch * 4 + q, tl.where(active, qdst, 0))
-    tl.store(current_valid + batch * 4 + q, active)
+    tl.store(current_dst + batch * Q + q, tl.where(active, qdst, 0))
+    tl.store(current_valid + batch * Q + q, active)
     # The following data copies and consumers all use this ordered stream.
     tl.store(starts + safe, prefix, mask=active)
     tl.store(ends + safe, last, mask=active)
@@ -65,11 +66,19 @@ def stage_mtp_tail(
     workspace,
     capacity,
     context_len,
+    query_width=4,
 ):
     """Write current candidates locally; restore only missing stable tail rows."""
     batch = requests.numel()
-    if positions.numel() < batch * 4 or current.shape[0] < batch * 4:
-        raise ValueError("Separate MTP tail requires four current KV rows per request")
+    if query_width not in (1, 4):
+        raise ValueError("Tail query width must be 1 or 4")
+    if (
+        positions.numel() < batch * query_width
+        or current.shape[0] < batch * query_width
+    ):
+        raise ValueError(
+            "Separate tail requires query_width current KV rows per request"
+        )
     hs, hd, hv, cs, cd, cv = workspace
     _tail_metadata_kernel[(batch,)](
         req_to_token,
@@ -86,6 +95,7 @@ def stage_mtp_tail(
         context_len,
         req_to_token.stride(0),
         capacity,
+        query_width,
     )
     unidex_copy_inplace(
         host,
@@ -101,9 +111,9 @@ def stage_mtp_tail(
     unidex_copy_inplace(
         current.view(-1, 1, current.shape[-1]),
         cache,
-        cs[: batch * 4],
-        cd[: batch * 4],
-        cv[: batch * 4],
+        cs[: batch * query_width],
+        cd[: batch * query_width],
+        cv[: batch * query_width],
         1,
         2,
         block_dim=48,

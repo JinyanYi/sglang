@@ -38,6 +38,11 @@ class TestDraftOffloadPolicy(unittest.TestCase):
         with (
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
             patch.object(config, "is_npu", return_value=True),
+            patch.object(
+                config,
+                "get_model",
+                return_value=SimpleNamespace(kv_cache_dtype="bfloat16"),
+            ),
             patch.object(config, "is_deepseek_dsa", return_value=True),
             patch.object(config, "get_sparse_kv_indexer_impl", return_value="legacy"),
             patch.object(

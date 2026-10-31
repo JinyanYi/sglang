@@ -54,6 +54,10 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         *,
         enable_memory_saver: bool = False,
     ) -> None:
+        self._is_draft_worker = cuda_graph_runner.model_runner.is_draft_worker
+        self._packed_c8 = (
+            cuda_graph_runner.model_runner.kv_cache_dtype == torch.float8_e4m3fn
+        )
         self._graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
@@ -142,9 +146,16 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._outputs[shape_key] = out
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
-        if forward_batch.forward_mode.is_decode() or (
-            envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
-            and forward_batch.forward_mode.is_target_verify()
+        if not self._is_draft_worker and (
+            forward_batch.forward_mode.is_decode()
+            or (
+                (
+                    envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
+                    or envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get()
+                    or self._packed_c8
+                )
+                and forward_batch.forward_mode.is_target_verify()
+            )
         ):
             # Copy-SFA v1 uses a fixed 2048-token cache window. Decide from
             # scheduler-owned CPU metadata before graph replay, so short or
