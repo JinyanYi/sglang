@@ -6,6 +6,12 @@ init_stage build-kernel
 require_dir "$KERNEL_ROOT"
 check_checkout kernel "$KERNEL_ROOT" 2>&1 | tee "$RUN_DIR/kernel-source.log"
 source_ascend_environment
+build_python_dir="$(dirname -- "$("$PYTHON_BIN" -c 'import sys; print(sys.executable)')")"
+[[ -x "$build_python_dir/python3" && -x "$build_python_dir/pip3" ]] || {
+  echo "Selected build environment must provide sibling python3 and pip3: $build_python_dir" >&2
+  exit 2
+}
+export PATH="$build_python_dir:$PATH"
 
 # build.sh installs the wheel build helper when it is absent. Refuse that
 # mutation here: prepare it in the task-private image/environment beforehand.
@@ -40,7 +46,7 @@ deep_ep_manifest() {
 }
 
 deep_ep_manifest "$RUN_DIR/deep_ep.before.sha256"
-run_logged build bash -lc 'cd "$1" && ./build.sh -a kernels "$2"' _ "$KERNEL_ROOT" "$SOC_VERSION"
+run_logged build bash -c 'cd "$1" && ./build.sh -a kernels "$2"' _ "$KERNEL_ROOT" "$SOC_VERSION"
 deep_ep_manifest "$RUN_DIR/deep_ep.after.sha256"
 run_logged deep_ep_unchanged diff -u "$RUN_DIR/deep_ep.before.sha256" "$RUN_DIR/deep_ep.after.sha256"
 

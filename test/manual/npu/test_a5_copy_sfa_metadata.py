@@ -1,4 +1,4 @@
-"""A5 Q1/Q4 pre/post fusions and C8 tail staging, independent of LIM binaries."""
+"""A3/A5 Q1/Q4 metadata and opaque C8 staging, without native FP8 attention."""
 
 import pytest
 import torch
@@ -7,11 +7,8 @@ torch_npu = pytest.importorskip("torch_npu")
 
 
 @pytest.fixture(scope="module", autouse=True)
-def require_a5():
-    import acl
-
-    if acl.rt.get_device_info(0, 601) != (3510, 0):
-        pytest.skip("These fusion and C8 transfer tests require Ascend950")
+def require_npu():
+    assert torch.npu.is_available(), "Metadata/transport checks need an NPU"
     torch.npu.set_device(0)
 
 

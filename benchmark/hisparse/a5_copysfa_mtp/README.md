@@ -49,6 +49,7 @@ known private environment.
 export FRAMEWORK_ROOT=/home/y00970600/personal/sglang
 export KERNEL_ROOT=/home/y00970600/personal/sgl-kernel-npu
 export PYTHON_BIN=/path/to/task-venv/bin/python
+export PATH="$(dirname "$PYTHON_BIN"):$PATH"
 export EXPECTED_KERNEL_PACKAGE_ROOT=/path/to/task-venv
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 ```
@@ -94,6 +95,28 @@ bash ./benchmark/hisparse/a5_copysfa_mtp/30_test_a5.sh model
 An exit code of zero covers only the named tests. It is not model-serving or
 performance evidence.
 
+Compare CopySFA directly with the pinned original vLLM ACLNN/OPP operator
+before model serving. This step needs no LIM. First build the offline private
+reference as described in the kernel checkout's
+`benchmark/copysfa_a5_ab/README.md`, using the same private Python/CANN runtime.
+The builder also checks byte-for-byte tiling serialization on CPU. Then run:
+
+```bash
+export ORIGINAL_PATHS_ENV=/work/copysfa-original-001/paths.env
+bash ./benchmark/hisparse/a5_copysfa_mtp/35_compare_vllm.sh smoke
+bash ./benchmark/hisparse/a5_copysfa_mtp/35_compare_vllm.sh formal
+```
+
+The formal comparison contains 38 cases: C8192/16384/32384, Q1/Q4,
+95/91 selected-prefix C-pool hit rates and eager/graph, plus overlap and
+functional boundaries. Accuracy is a hard gate; latency is reported with a
+warning above 20% regression by default. It does not block accuracy work.
+The actual hit-rate denominators and raw timing samples are retained.
+
+Use kernel `995130e` or later. This includes `be61600`, which fixes the earlier
+direct-launch tiling layout (80 serialized bytes with nested padding, rather
+than 96), and explicit batch scheduling for the four CopySFA entrypoints.
+
 ## Model serving
 
 The launch defaults are target-only LIM + CopySFA, C=16384, FP8 E4M3 KV,
@@ -120,6 +143,15 @@ bash ./benchmark/hisparse/a5_copysfa_mtp/40_launch_server.sh
 Do not add `--disable-radix-cache`. If memory sizing requires an explicit
 `MAX_TOTAL_TOKENS`, set it from the actual model, TP and device capacity rather
 than copying a value from another host.
+
+For model integration, run all four `MTP`/`GRAPH` combinations separately:
+`0/0`, `0/1`, `1/0`, `1/1`. Both default to 1. Export the selected values
+before launching and retain them for the startup-log check, for example
+`export MTP=0 GRAPH=0`. MTP=0 omits every speculative argument; MTP=1 uses
+NEXTN 3/1/4. GRAPH=0 disables graph capture. Keep radix enabled throughout and
+repeat the prefix semantic check for each combination. C8192/16384/32384 are
+capacity settings, not guarantees of a measured 95% or 91% model hit rate;
+those controlled hit rates belong to the standalone comparison matrix.
 
 While the service is running, validate the allocation-role lines from its log:
 

@@ -17,11 +17,13 @@ MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.90}"
 QUANTIZATION="${QUANTIZATION:-modelslim}"
 SPARSE_CACHE_SIZE="${SPARSE_CACHE_SIZE:-16384}"
 GRAPH="${GRAPH:-1}"
+MTP="${MTP:-1}"
 
-for name in PORT TP_SIZE EP_SIZE MAX_RUNNING_REQUESTS CONTEXT_LENGTH CHUNKED_PREFILL_SIZE MAX_PREFILL_TOKENS SPARSE_CACHE_SIZE GRAPH; do
+for name in PORT TP_SIZE EP_SIZE MAX_RUNNING_REQUESTS CONTEXT_LENGTH CHUNKED_PREFILL_SIZE MAX_PREFILL_TOKENS SPARSE_CACHE_SIZE GRAPH MTP; do
   [[ "${!name}" =~ ^[0-9]+$ ]] || { echo "$name must be an integer" >&2; exit 2; }
 done
 [[ "$GRAPH" == 0 || "$GRAPH" == 1 ]] || { echo "GRAPH must be 0 or 1" >&2; exit 2; }
+[[ "$MTP" == 0 || "$MTP" == 1 ]] || { echo "MTP must be 0 or 1" >&2; exit 2; }
 (( SPARSE_CACHE_SIZE >= 8192 && SPARSE_CACHE_SIZE <= 32384 && SPARSE_CACHE_SIZE % 128 == 0 )) || {
   echo "A5 Q4 SPARSE_CACHE_SIZE must be a 128-aligned value in [8192, 32384]" >&2
   exit 2
@@ -37,11 +39,13 @@ args=("$PYTHON_BIN" -m sglang.launch_server
   --max-running-requests "$MAX_RUNNING_REQUESTS"
   --context-length "$CONTEXT_LENGTH" --mem-fraction-static "$MEM_FRACTION_STATIC"
   --moe-a2a-backend deepep
-  --speculative-algorithm NEXTN --speculative-num-steps 3
-  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
   --random-seed 42 --enable-metrics --host "$HOST" --port "$PORT")
 [[ -z "$QUANTIZATION" || "$QUANTIZATION" == none ]] || args+=(--quantization "$QUANTIZATION")
 [[ -z "${MAX_TOTAL_TOKENS:-}" ]] || args+=(--max-total-tokens "$MAX_TOTAL_TOKENS")
+if (( MTP )); then
+  args+=(--speculative-algorithm NEXTN --speculative-num-steps 3
+    --speculative-eagle-topk 1 --speculative-num-draft-tokens 4)
+fi
 if (( GRAPH )); then
   args+=(--cuda-graph-bs-decode "$MAX_RUNNING_REQUESTS")
 else
@@ -49,7 +53,7 @@ else
 fi
 
 if [[ "${1:-}" == --dry-run ]]; then
-  printf 'radix=enabled target_offload=lim+copysfa kv_cache=fp8_e4m3 C=%s metadata_fusions=1 nextn=3/1/4 draft_offload=disabled profile=off\n' "$SPARSE_CACHE_SIZE"
+  printf 'radix=enabled target_offload=lim+copysfa kv_cache=fp8_e4m3 C=%s metadata_fusions=1 MTP=%s GRAPH=%s draft_offload=disabled profile=off\n' "$SPARSE_CACHE_SIZE" "$MTP" "$GRAPH"
   printf '%q ' "${args[@]}"
   printf '\n'
   exit 0

@@ -36,6 +36,7 @@ def install_sparse_reset(pool: ReqToTokenPool, copy_sfa_enabled: bool):
     manager.use_lru = False
     manager.lim_adapter = None
     manager.copy_sfa_enabled = copy_sfa_enabled
+    manager.separate_mtp_tail = False
     manager.device_slot_map = [torch.full((pool._alloc_size, 2), 7) for _ in range(2)]
     manager.device_slot_owner = [torch.full((pool._alloc_size, 2), 9) for _ in range(2)]
     manager._install_req_alloc_hook(pool)

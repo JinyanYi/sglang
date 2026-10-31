@@ -16,6 +16,7 @@ PATTERN = re.compile(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("log", type=Path)
+    parser.add_argument("--mtp", type=int, choices=(0, 1), default=1)
     args = parser.parse_args()
     text = args.log.read_text(errors="replace")
     records = [
@@ -26,9 +27,11 @@ def main() -> int:
     drafts = [item for item in records if item[0] == "draft"]
     targets = [item for item in records if item[0] == "target"]
     # C8 embeds RoPE in each CKV record; its separate KPE allocation is empty.
-    if not drafts or not all(
-        not offload and ckv > 0 for _, offload, ckv, _, _ in drafts
-    ):
+    if args.mtp and not drafts:
+        raise RuntimeError("MTP=1 must allocate draft KV")
+    if not args.mtp and drafts:
+        raise RuntimeError("MTP=0 must not allocate draft KV")
+    if not all(not offload and ckv > 0 for _, offload, ckv, _, _ in drafts):
         raise RuntimeError(
             "Every draft allocation must have offload=False and positive CKV bytes"
         )

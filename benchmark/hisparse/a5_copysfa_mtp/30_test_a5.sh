@@ -25,6 +25,7 @@ run_logged kernel_a5 "$PYTHON_BIN" -m pytest -q \
 
 framework_tests=(
   "$FRAMEWORK_ROOT/test/manual/npu/test_a5_copy_sfa_metadata.py"
+  "$FRAMEWORK_ROOT/test/manual/npu/test_sparse_kv_packed_transport.py"
 )
 if [[ "$MODE" == model ]]; then
   framework_tests+=(
