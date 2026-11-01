@@ -4,6 +4,7 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 init_stage prefix-sanity
 require_value MODEL_PATH
+source_ascend_environment
 BASE_URL="${BASE_URL:-http://127.0.0.1:${PORT:-30000}}"
 read -r -a prefix_counts <<< "${PREFIX_COUNTS:-1 2 4}"
 run_logged prefix "$PYTHON_BIN" "$HANDOFF_DIR/prefix_sanity.py" \

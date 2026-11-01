@@ -73,6 +73,7 @@ def main() -> int:
         "visible_devices": os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
     }
 
+    import sgl_kernel_npu
     import torch
     import torch_npu  # noqa: F401
 
@@ -105,8 +106,6 @@ def main() -> int:
             f"sglang resolves outside FRAMEWORK_ROOT/python: {framework_module}"
         )
 
-    import sgl_kernel_npu
-
     kernel_module = Path(sgl_kernel_npu.__file__).resolve()
     kernel_so = kernel_module.parent / "lib" / "libsgl_kernel_npu.so"
     report["sgl_kernel_npu_module"] = str(kernel_module)
@@ -123,6 +122,16 @@ def main() -> int:
             f"{kernel_module}"
         )
 
+    if args.mode == "model":
+        report["lim_backend"] = torch.ops.npu.a5_c8_backend()
+        if report["lim_backend"] != "original":
+            raise RuntimeError("Joint A5 wheel must use original LIM OPP")
+        report["lim_aclnn_libraries"] = {
+            name: {"path": path, "sha256": sha256(Path(path))}
+            for name, path in dict(
+                torch.ops.npu.resolve_a5_c8_original_libraries()
+            ).items()
+        }
     copy_schemas = schemas_for(torch, COPY_OP)
     if args.mode == "model":
         lim_library_value = os.environ.get("SGLANG_NPU_A5_LIM_LIBRARY", "")

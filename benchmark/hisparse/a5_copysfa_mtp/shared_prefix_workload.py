@@ -30,6 +30,14 @@ def repeated(values: list[int], size: int) -> list[int]:
     return (values * ((size + len(values) - 1) // len(values)))[:size]
 
 
+class ActiveStreams(set):
+    peak = 0
+
+    def add(self, item):
+        super().add(item)
+        self.peak = max(self.peak, len(self))
+
+
 def stream_one(
     url,
     ids,
@@ -62,34 +70,38 @@ def stream_one(
     prompt = None
     cached = None
     finish = None
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        for raw in response:
-            line = raw.strip()
-            if not line or line == b"data: [DONE]":
-                continue
-            data = json.loads(line[6:] if line.startswith(b"data: ") else line)
-            meta = data.get("meta_info") or {}
-            completion = max(completion, int(meta.get("completion_tokens") or 0))
-            if completion and first is None:
-                first = time.perf_counter()
-                with print_lock:
-                    print(
-                        f"FIRST_STREAM_EVENT request={index} "
-                        f"ttft_seconds={first - started:.6f}",
-                        flush=True,
-                    )
-                    if index >= 0:
-                        active_requests.add(index)
-                        if len(active_requests) == active_target:
-                            print(
-                                f"ALL_STREAMS_ACTIVE count={active_target}",
-                                flush=True,
-                            )
-            if meta.get("prompt_tokens") is not None:
-                prompt = int(meta["prompt_tokens"])
-            if meta.get("cached_tokens") is not None:
-                cached = int(meta["cached_tokens"])
-            finish = meta.get("finish_reason") or finish
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            for raw in response:
+                line = raw.strip()
+                if not line or line == b"data: [DONE]":
+                    continue
+                data = json.loads(line[6:] if line.startswith(b"data: ") else line)
+                meta = data.get("meta_info") or {}
+                completion = max(completion, int(meta.get("completion_tokens") or 0))
+                if completion and first is None:
+                    first = time.perf_counter()
+                    with print_lock:
+                        print(
+                            f"FIRST_STREAM_EVENT request={index} "
+                            f"ttft_seconds={first - started:.6f}",
+                            flush=True,
+                        )
+                        if index >= 0:
+                            active_requests.add(index)
+                            if len(active_requests) == active_target:
+                                print(
+                                    f"ALL_STREAMS_ACTIVE count={active_target}",
+                                    flush=True,
+                                )
+                if meta.get("prompt_tokens") is not None:
+                    prompt = int(meta["prompt_tokens"])
+                if meta.get("cached_tokens") is not None:
+                    cached = int(meta["cached_tokens"])
+                finish = meta.get("finish_reason") or finish
+    finally:
+        with print_lock:
+            active_requests.discard(index)
     ended = time.perf_counter()
     if first is None or completion != output_tokens:
         raise RuntimeError(
@@ -146,7 +158,7 @@ def main() -> int:
     if args.flush:
         post(base + "/flush_cache", {}, args.timeout)
     lock = threading.Lock()
-    active_requests = set()
+    active_requests = ActiveStreams()
     active_target = min(args.num_prompts, args.concurrency)
     prime = stream_one(
         base + "/generate",
@@ -158,6 +170,15 @@ def main() -> int:
         active_requests,
         active_target,
     )
+
+    def metrics_snapshot(name):
+        try:
+            with urllib.request.urlopen(base + "/metrics", timeout=30) as response:
+                (args.output.parent / name).write_bytes(response.read())
+        except Exception as exc:
+            (args.output.parent / (name + ".error")).write_text(str(exc))
+
+    metrics_snapshot("metrics-before.txt")
     started = time.perf_counter()
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         futures = [
@@ -183,6 +204,7 @@ def main() -> int:
     if misses:
         raise RuntimeError(f"measured requests did not report radix hits: {misses}")
     elapsed = time.perf_counter() - started
+    metrics_snapshot("metrics-after.txt")
     total = sum(row["completion_tokens"] for row in rows)
     result = {
         "input_tokens": args.input_tokens,
@@ -191,6 +213,8 @@ def main() -> int:
         "output_tokens_per_request": args.output_tokens,
         "num_prompts": args.num_prompts,
         "concurrency": args.concurrency,
+        "peak_live_client_streams": active_requests.peak,
+        "client_streams_are_not_proof_of_server_batch_size": True,
         "prime": prime,
         "completed": len(rows),
         "total_output_tokens": total,

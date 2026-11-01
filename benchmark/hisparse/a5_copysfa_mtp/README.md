@@ -14,17 +14,12 @@ Use these two personal-fork checkouts together:
 - kernel: `feat/a5-copysfa-mtp-radix-20261031`, based on the same named remote
   branch at `db77f6fd2db26b2e60a02c63f821121045482835`.
 
-The kernel changes in this pair port only the A5 C8 CopySFA operator. They do
-not implement A5 LIM and do not depend on vLLM. Standalone CopySFA tests use the
-`copy` preflight mode. Framework model serving uses `model` mode and will stop
-unless the colleague's paired Ascend950 package exposes
-`npu::fused_quant_lightning_indexer_manage` with exactly 19 Tensor arguments.
-Do not inject a placeholder operator, copy a vLLM library, or weaken this gate.
-The preferred delivery is the colleague's LIM implementation in the same paired
-wheel. An optional separate DSO may be selected with
-`SGLANG_NPU_A5_LIM_LIBRARY=/path/to/lim-only.so`; it must be LIM-only. Do not
-point this variable at a full WMC/vLLM library that also registers CopySFA,
-because the paired kernel wheel already owns that operator.
+The paired wheel now integrates McZyWu's original A5 LIM OPP with our
+A5-tested native CopySFA, retaining independent operator registrations and
+the existing metadata fusions. See [JOINT_A5.md](JOINT_A5.md) for the current
+build, real LIM-to-CopySFA graph/Q4/fusion tests, manual serving and no-stack
+profiling workflow. Rebuild/install this wheel before model-mode preflight;
+leave `SGLANG_NPU_A5_LIM_LIBRARY` unset. The OPP is activated before NPU init.
 
 The cross-component address contract is also fixed:
 

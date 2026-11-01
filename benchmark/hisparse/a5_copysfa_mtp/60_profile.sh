@@ -19,35 +19,28 @@ fi
 PROFILE_DIR="${PROFILE_DIR:-$RUN_DIR/profile}"
 PROFILE_STEPS="${PROFILE_STEPS:-20}"
 PROFILE_TIMEOUT="${PROFILE_TIMEOUT:-900}"
+[[ ! -e "$PROFILE_DIR" ]] || { echo "Preserve existing capture: $PROFILE_DIR" >&2; exit 2; }
 mkdir -p "$PROFILE_DIR"
-echo "Run this only after 55_steady_decode.sh prints ALL_STREAMS_ACTIVE."
+echo "Run after ALL_STREAMS_ACTIVE; actual batch sizes are checked in the trace."
 run_logged profile_start "$PYTHON_BIN" "$HANDOFF_DIR/profile_control.py" start \
-  --base-url "$BASE_URL" --output-dir "$PROFILE_DIR" --num-steps "$PROFILE_STEPS"
+  --base-url "$BASE_URL" --output-dir "$PROFILE_DIR" --num-steps "$PROFILE_STEPS" \
+  --receipt "$RUN_DIR/profile-request.json"
 
 deadline=$((SECONDS + PROFILE_TIMEOUT))
-while ! find "$PROFILE_DIR" -type f -print -quit | grep -q .; do
+while true; do
+  if "$PYTHON_BIN" "$HANDOFF_DIR/analyze_profile.py" "$PROFILE_DIR" \
+      --output "$RUN_DIR/profile-summary.json" \
+      --require-joint --expected-ranks "${TP_SIZE:-8}" --batch "${CONCURRENCY:-16}" \
+      --min-steps "${PROFILE_MIN_STEPS:-$PROFILE_STEPS}" \
+      > "$RUN_DIR/profile-validation.log" 2>&1; then
+    cat "$RUN_DIR/profile-validation.log"
+    break
+  fi
   if (( SECONDS >= deadline )); then
     "$PYTHON_BIN" "$HANDOFF_DIR/profile_control.py" stop --base-url "$BASE_URL" \
-      2>&1 | tee "$RUN_DIR/profile-stop-after-timeout.log" || true
-    echo "Timed out waiting for profile output under $PROFILE_DIR" >&2
-    exit 1
-  fi
-  sleep 2
-done
-# Do not treat an eagerly created trace file as a completed capture. Require
-# the file-size manifest to remain unchanged across three polls.
-previous_manifest=""
-stable_polls=0
-while (( stable_polls < 3 )); do
-  current_manifest="$(find "$PROFILE_DIR" -type f -printf '%s %p\n' | sort)"
-  if [[ "$current_manifest" == "$previous_manifest" ]]; then
-    stable_polls=$((stable_polls + 1))
-  else
-    stable_polls=0
-    previous_manifest="$current_manifest"
-  fi
-  if (( SECONDS >= deadline )); then
-    echo "Profile files did not stabilize under $PROFILE_DIR" >&2
+      > "$RUN_DIR/profile-stop-after-timeout.log" 2>&1 || true
+    cat "$RUN_DIR/profile-validation.log"
+    echo "Capture incomplete: inspect rank traces, target steps and batch sizes." >&2
     exit 1
   fi
   sleep 2

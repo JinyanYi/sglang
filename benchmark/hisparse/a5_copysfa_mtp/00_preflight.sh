@@ -22,5 +22,6 @@ require_value ASCEND_RT_VISIBLE_DEVICES
 
 source_ascend_environment
 prepend_framework_python
+activate_joint_opp
 export FRAMEWORK_ROOT
 run_logged preflight "$PYTHON_BIN" "$HANDOFF_DIR/preflight.py" --mode "$MODE"

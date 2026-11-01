@@ -69,6 +69,7 @@ init_stage launch-server
 } 2>&1 | tee "$RUN_DIR/source.log"
 source_ascend_environment
 prepend_framework_python
+activate_joint_opp
 export FRAMEWORK_ROOT
 
 # C8 offload is target-only. The draft worker retains its native HBM KV pool;

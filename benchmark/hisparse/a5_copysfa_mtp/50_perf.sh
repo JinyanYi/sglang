@@ -4,6 +4,7 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 init_stage serving-perf
 require_value MODEL_PATH
+source_ascend_environment
 
 run_logged benchmark "$PYTHON_BIN" "$HANDOFF_DIR/shared_prefix_workload.py" \
   --base-url "${BASE_URL:-http://127.0.0.1:${PORT:-30000}}" \

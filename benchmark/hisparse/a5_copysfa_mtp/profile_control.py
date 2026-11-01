@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import urllib.request
+from pathlib import Path
 
 
 def main() -> int:
@@ -14,6 +15,7 @@ def main() -> int:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--output-dir")
     parser.add_argument("--num-steps", type=int, default=20)
+    parser.add_argument("--receipt", type=Path)
     args = parser.parse_args()
     endpoint = "/start_profile" if args.action == "start" else "/stop_profile"
     payload = {}
@@ -29,6 +31,10 @@ def main() -> int:
             "profile_id": "a5-copysfa-mtp",
             "num_steps": args.num_steps,
         }
+    if args.receipt:
+        args.receipt.write_text(
+            json.dumps(dict(endpoint=endpoint, payload=payload), indent=2) + "\n"
+        )
     request = urllib.request.Request(
         args.base_url.rstrip("/") + endpoint,
         data=json.dumps(payload).encode(),

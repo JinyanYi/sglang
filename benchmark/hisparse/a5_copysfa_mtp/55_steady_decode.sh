@@ -4,6 +4,7 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 init_stage steady-decode
 require_value MODEL_PATH
+source_ascend_environment
 
 echo "Wait for ALL_STREAMS_ACTIVE, then start 60_profile.sh in another terminal."
 run_logged workload "$PYTHON_BIN" "$HANDOFF_DIR/shared_prefix_workload.py" \

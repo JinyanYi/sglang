@@ -16,6 +16,7 @@ set +u
 source "$ORIGINAL_PATHS_ENV"
 set -u
 prepend_framework_python
+activate_joint_opp
 export FRAMEWORK_ROOT
 run_logged preflight "$PYTHON_BIN" "$HANDOFF_DIR/preflight.py" --mode copy
 args=("$PYTHON_BIN" "$KERNEL_ROOT/benchmark/copysfa_a5_ab/run_matrix.py"

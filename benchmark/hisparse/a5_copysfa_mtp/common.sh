@@ -51,7 +51,16 @@ run_logged() {
   return "$rc"
 }
 
+activate_joint_opp() {
+  require_file "$KERNEL_ROOT/tools/a5_c8/env.py"
+  local exports
+  exports="$("$PYTHON_BIN" "$KERNEL_ROOT/tools/a5_c8/env.py")" || return $?
+  eval "$exports"
+  export FRAMEWORK_ROOT KERNEL_ROOT
+}
+
 source_ascend_environment() {
+  PYTHON_BIN="$("$PYTHON_BIN" -c 'import sys; print(sys.executable)')"
   local toolkit_env="${ASCEND_TOOLKIT_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
   local atb_env="${ATB_ENV:-/usr/local/Ascend/nnal/atb/set_env.sh}"
   require_file "$toolkit_env"
@@ -60,6 +69,7 @@ source_ascend_environment() {
   # CANN and ATB may read unset shell variables while initializing.
   source "$toolkit_env"
   source "$atb_env"
+  export PATH="$(dirname -- "$PYTHON_BIN"):$PATH"
   set -u
 }
 
