@@ -66,10 +66,13 @@ export FRAMEWORK_ROOT=/mnt/share/y00970600/personal/sglang
 export KERNEL_ROOT=/mnt/share/y00970600/personal/sgl-kernel-npu
 export PYTHON_BIN="$(command -v python3)"
 export RUN_ROOT=/mnt/share/y00970600/a5-joint-runs
-export MODEL_PATH=/path/to/your/A5/model
+export MODEL_PATH=/path/to/GLM-5.2-W4A4-MXFP4
+export QUANTIZATION=modelslim
+export INPUT_TOKENS=40000 OUTPUT_TOKENS=1024 CONTEXT_LENGTH=45056
+export CHUNKED_PREFILL_SIZE=4096
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export TP_SIZE=8 EP_SIZE=8 PORT=30000
-export SPARSE_CACHE_SIZE=16384 MAX_RUNNING_REQUESTS=16
+export SPARSE_CACHE_SIZE=12288 MAX_RUNNING_REQUESTS=16
 export MTP=1 GRAPH=1
 cd "$FRAMEWORK_ROOT"
 bash benchmark/hisparse/a5_copysfa_mtp/40_launch_server.sh
@@ -85,7 +88,12 @@ modelslim; adjust `QUANTIZATION` only for the model actually being loaded.
 
 ## 3. Correctness and unprofiled throughput in terminal B
 
-Export the same framework/model/port/RUN_ROOT variables in this terminal.
+Export the same framework/model/port/RUN_ROOT and INPUT_TOKENS variables in this terminal.
+The sourceable `article_single_node.env.example` contains this complete initial
+configuration for every terminal; replace its MODEL_PATH placeholder first.
+ModelSlim supports the W4A4_MXFP4 checkpoint scheme in this framework. The
+initial workload aligns with the article at40000 input tokens, C12288 and BS16;
+TP8/DP1 topology and actual acceptance still differ from the article.
 
 ```bash
 cd "$FRAMEWORK_ROOT"
