@@ -236,18 +236,42 @@ with radix, unprofiled throughput, then this single no-stack profiling capture.
 
 If graph capture reports `aclnnMoeLowLatencyDispatchV2` or its workspace
 function missing, inspect library lookup before changing memory sizing or
-graph/MTP settings. DeepEP's adapter uses a bare `libcust_opapi.so` handle;
-the original LIM also installs that filename, and activation currently places
-its library directory first. This is a source-level collision risk, not yet
-proof of which DSO the failed A5 process selected. The existing DeepEP wheel
-could also lack matching operators or dependencies. The kernel-only build
-intentionally leaves the installed DeepEP wheel unchanged.
+graph/MTP settings. The November 2 user probe confirmed that DeepEP's vendor
+library (SHA prefix `848792579ca1`) has all four V2 dispatch/combine symbols,
+but the bare `libcust_opapi.so` handle selected LIM (SHA prefix `6887249a1f24`),
+which lacks them. The system library also lacks these custom interfaces.
+The old DeepEP bridge cached that wrong handle. A successful LIM/CopySFA
+operator test does not exercise the separate MoE bridge.
+
+The fixed DeepEP bridge uses `SGLANG_DEEPEP_OP_API_LIBRARY`, an absolute path
+to its own installed vendor, regardless of import order. Standard CANN helper
+functions still fall back to `libopapi.so`. No LIM/CopySFA computation, DeepEP
+device implementation or graph/MTP setting is changed. Native Linux CPU
+loader tests reproduce the old collision and cover both import orders,
+standard fallback and invalid pins; they are not A5 device tests.
+
+Update both personal branches, then rebuild only the DeepEP host bridge:
+
+```bash
+source benchmark/hisparse/a5_copysfa_mtp/article_single_node.env.example
+bash benchmark/hisparse/a5_copysfa_mtp/11_rebuild_deepep_bridge.sh
+```
+
+This script saves the currently installed DeepEP vendor and a complete file
+hash manifest, rebuilds the bridge with that exact vendor (no device-kernel
+compilation), installs only the new DeepEP wheel with `--no-deps`, and verifies
+the installed vendor hashes and existing `libsgl_kernel_npu.so` are unchanged.
+The installed DeepEP baseline `a5c12d19` has the same device sources as this
+branch. Do not run `10_build_kernel.sh` for this loader repair. The repaired
+bridge still requires an A5 build and actual joint serving validation.
 
 Run `bash benchmark/hisparse/a5_copysfa_mtp/37_check_deepep.sh` after sourcing
-the same article environment. It imports the original LIM, resolves its DSO,
-then compares the absolute DeepEP vendor library against the bare-name and
-standard-library lookup. It records paths, hashes, versions, import errors and
-both V2 dispatch/combine API pairs. It does not load the model or execute NPU
-operators. The import order is explicit in its report; this is a probe, not
-an assertion about the exact import order of the earlier failed server.
-The complete report is in the printed run directory's `libraries.log`.
+the same article environment. It checks LIM-first and DeepEP-first in separate
+fresh processes. Both must report `pass_pinned_deepep`, with the actual C++
+adapter's four `adapter_libraries` entries pointing to the selected DeepEP
+vendor. The raw bare-name probe may still show LIM; that is safe because the
+fixed adapter no longer uses it. It records paths, hashes, versions and import
+errors without loading the model or executing NPU operators. The complete
+reports are `libraries-lim-first.log` and `libraries-deepep-first.log` in the
+printed run directory. The launcher also checks the adapter before weights
+load, so an old bridge fails early with a specific library report.

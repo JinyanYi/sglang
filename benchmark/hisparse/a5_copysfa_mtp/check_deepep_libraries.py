@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import ctypes
 import ctypes.util
 import hashlib
@@ -44,11 +45,17 @@ def inspect_library(path):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--order", choices=("lim-first", "deepep-first"), default="lim-first"
+    )
+    args = parser.parse_args()
     report = {
-        "import_order": "sgl_kernel_npu and original LIM resolver, then deep_ep",
+        "import_order": args.order,
         "boundary": "Library lookup probe only; no NPU operators, model or graph executed",
         "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH"),
         "ASCEND_CUSTOM_OPP_PATH": os.environ.get("ASCEND_CUSTOM_OPP_PATH"),
+        "SGLANG_DEEPEP_OP_API_LIBRARY": os.environ.get("SGLANG_DEEPEP_OP_API_LIBRARY"),
     }
     try:
         distribution = importlib.metadata.distribution("deep_ep")
@@ -57,6 +64,8 @@ def main():
         report.update(
             deep_ep_version=distribution.version, expected_library=str(expected)
         )
+        if args.order == "deepep-first":
+            import deep_ep
         import sgl_kernel_npu
         import torch
 
@@ -78,8 +87,21 @@ def main():
         standard = report["standard"].get("symbols", {})
         if "deep_ep_import_error" in report:
             report["status"] = "deep_ep_import_failed"
+        elif hasattr(deep_ep_cpp, "resolve_op_api_libraries"):
+            resolved = dict(deep_ep_cpp.resolve_op_api_libraries())
+            report["adapter_libraries"] = resolved
+            report["status"] = (
+                "pass_pinned_deepep"
+                if all(
+                    Path(resolved[name]).resolve() == expected.resolve()
+                    for name in SYMBOLS
+                )
+                else "adapter_resolved_outside_selected_deepep_vendor"
+            )
         elif all(bare.get(name) or standard.get(name) for name in SYMBOLS):
-            report["status"] = "symbols_available_in_probe"
+            report["status"] = (
+                "symbols_available_but_adapter_needs_private_library_support"
+            )
         elif all(own.get(name) for name in SYMBOLS):
             report["status"] = "deepep_library_has_symbols_but_bare_lookup_misses"
         else:
@@ -87,7 +109,7 @@ def main():
     except Exception as exc:
         report.update(status="probe_failed", error=f"{type(exc).__name__}: {exc}")
     print(json.dumps(report, indent=2), flush=True)
-    return 0 if report["status"] == "symbols_available_in_probe" else 1
+    return 0 if report["status"] == "pass_pinned_deepep" else 1
 
 
 if __name__ == "__main__":

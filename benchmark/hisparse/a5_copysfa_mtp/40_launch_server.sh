@@ -103,6 +103,7 @@ mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
 printf 'world=%s attention_DP=%s attention_TP=%s EP=%s per_DP_batch=%s global_requests=%s graph_bucket=%s MTP=%s GRAPH=%s DeepEP_dispatch_capacity=%s HCCL_BUFFSIZE=%s\n' \
   "$TP_SIZE" "$ATTN_DP_SIZE" "$((TP_SIZE / ATTN_DP_SIZE))" "$EP_SIZE" "$PER_DP_BATCH_SIZE" "$MAX_RUNNING_REQUESTS" "$GRAPH_BATCH_SIZE" "$MTP" "$GRAPH" "$SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK" "$HCCL_BUFFSIZE" | tee "$RUN_DIR/topology.log"
 
+run_logged deepep_libraries "$PYTHON_BIN" "$HANDOFF_DIR/check_deepep_libraries.py"
 run_logged preflight "$PYTHON_BIN" "$HANDOFF_DIR/preflight.py" --mode model
 printf '%q ' "${args[@]}" | tee "$RUN_DIR/server.command"
 printf '\n' | tee -a "$RUN_DIR/server.command"

@@ -6,4 +6,6 @@ source_ascend_environment
 prepend_framework_python
 configure_deepep_environment
 activate_joint_opp
-run_logged libraries "$PYTHON_BIN" "$HANDOFF_DIR/check_deepep_libraries.py"
+for order in lim-first deepep-first; do
+  run_logged "libraries-$order" "$PYTHON_BIN" "$HANDOFF_DIR/check_deepep_libraries.py" --order "$order"
+done

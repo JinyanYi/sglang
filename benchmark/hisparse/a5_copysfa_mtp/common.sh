@@ -54,6 +54,8 @@ configure_deepep_environment() {
   local package
   package="$("$PYTHON_BIN" -c 'from importlib.metadata import distribution; print(distribution("deep_ep").locate_file("deep_ep"))')" || return $?
   require_dir "$package/vendors/hwcomputing" || return $?
+  export SGLANG_DEEPEP_OP_API_LIBRARY="$package/vendors/hwcomputing/op_api/lib/libcust_opapi.so"
+  require_file "$SGLANG_DEEPEP_OP_API_LIBRARY" || return $?
   export PYTHONPATH="$package${PYTHONPATH:+:$PYTHONPATH}"
   export LD_LIBRARY_PATH="$package/vendors/hwcomputing/op_api/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   export ASCEND_CUSTOM_OPP_PATH="$package/vendors/hwcomputing${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
