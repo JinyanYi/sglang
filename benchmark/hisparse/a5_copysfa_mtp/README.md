@@ -29,8 +29,9 @@ For the current **40K, C12288, attention DP4/TP2, EP8, MTP3 + graph** launch,
 source `article_single_node.env.example` and follow [JOINT_A5.md](JOINT_A5.md).
 Its global concurrency is 64 and per-DP graph batch is 16. The direct launch
 defaults below remain a DP1 diagnostic configuration. Current A5 joint
-runtime acceptance is pending user execution; the earlier donor deployment
-was Q1 with radix disabled and does not establish this MTP/radix behavior.
+operator joint gate passed 52 tests with zero skips/failures/errors in the
+user's November 2 A5 run. Whole-model DP4 serving and profiling remain pending;
+the earlier donor deployment was Q1 with radix disabled.
 After serving checks pass, `AUTO_PROFILE=1 OUTPUT_TOKENS=4096 bash
 benchmark/hisparse/a5_copysfa_mtp/55_steady_decode.sh` automatically waits for
 continuous full client progress, captures without stacks and validates all

@@ -15,10 +15,14 @@ ABI and explicit batch scheduling. The two production operators have separate
 registrations in one wheel. No vLLM Python installation or external LIM DSO
 is required. The private LIM OPP is bundled and hash checked.
 
-This is source/build/test preparation. The agent cannot access A5. Installing
-the new wheel and obtaining actual A5 results are required before acceptance.
-A3 results and earlier standalone CopySFA results do not establish this joint
-A5 implementation's graph/MTP behavior.
+The agent cannot access A5. User-run evidence on November 2, stage
+`20261102T111122Z-test-a5-model`, reports 25 framework tests passed and a joint
+gate with 52 total tests, zero failures/errors/skips and no missing joint cases.
+This covers the real Q1/Q4 eager/graph operator/fusion tests. The excerpt does
+not include checkout/SO hashes; retain that stage's source and preflight logs
+with its JUnits. Whole-model accuracy, DP4 serving and profiling still require
+separate validation. The automatic profiling controller has CPU coverage;
+this is its first A5 whole-model application.
 
 ## 1. Update, build and install in the same A5 container
 
