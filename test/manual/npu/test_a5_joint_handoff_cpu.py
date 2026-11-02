@@ -174,12 +174,22 @@ def test_runtime_gate_rejects_reduced_capacity_and_disabled_graph():
     assert checker.validate({"internal_states": [state]}, **kwargs)
 
 
-def test_dp_workload_primes_and_routes_every_worker(tmp_path, monkeypatch):
+@pytest.mark.parametrize("profiled", [False, True])
+def test_dp_workload_primes_and_routes_every_worker(tmp_path, monkeypatch, profiled):
     import sys
     from types import SimpleNamespace
 
     workload = load("shared_prefix_workload")
     calls = []
+    captures = []
+    monkeypatch.setattr(
+        workload, "wait_for_profile_window", lambda *args: {"live_streams": 8}
+    )
+    monkeypatch.setattr(
+        workload.subprocess,
+        "run",
+        lambda *args, **kwargs: captures.append((args, kwargs)),
+    )
 
     def stream(url, ids, output, timeout, index, lock, active, target, dp_rank=None):
         calls.append((index, dp_rank))
@@ -231,7 +241,74 @@ def test_dp_workload_primes_and_routes_every_worker(tmp_path, monkeypatch):
             str(output),
         ],
     )
+    if profiled:
+        sys.argv.extend(["--profile-root", str(tmp_path)])
     assert workload.main() == 0
     assert calls[:4] == [(-1, rank) for rank in range(4)]
     assert sorted(calls[4:]) == [(index, index % 4) for index in range(8)]
     assert json.loads(output.read_text())["concurrency_per_dp"] == 2
+    assert json.loads(output.read_text())["profiled"] is profiled
+    assert len(captures) == int(profiled)
+    if profiled:
+        assert captures[0][1]["env"]["PROFILE_DIR"] == str(tmp_path / "profile")
+        assert captures[0][1]["env"]["RUN_DIR"] == str(tmp_path / "capture")
+
+
+def test_auto_profile_requires_continuous_live_window(monkeypatch):
+    import threading
+    from types import SimpleNamespace
+
+    workload = load("shared_prefix_workload")
+    active = workload.ActiveStreams()
+    active.update((0, 1))
+    active.progress.update({0: 64, 1: 64})
+    clock = [0]
+
+    def sleep(seconds):
+        clock[0] += 1
+        if clock[0] == 1:
+            active.discard(1)
+        elif clock[0] == 2:
+            active.add(1)
+            active.progress[1] = 64
+
+    monkeypatch.setattr(workload.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(workload.time, "sleep", sleep)
+    pending = SimpleNamespace(done=lambda: False)
+    result = workload.wait_for_profile_window(
+        [pending, pending], active, threading.Lock(), 2, 64, 2, 10
+    )
+    assert result["waited_seconds"] == 4
+    assert result["stable_seconds"] == 2
+
+
+def test_auto_profile_times_out_without_token_progress(monkeypatch):
+    import threading
+    from types import SimpleNamespace
+
+    workload = load("shared_prefix_workload")
+    active = workload.ActiveStreams()
+    active.add(0)
+    active.progress[0] = 1
+    clock = [0]
+    monkeypatch.setattr(workload.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        workload.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + 1)
+    )
+    with pytest.raises(TimeoutError, match="No stable profiling window"):
+        workload.wait_for_profile_window(
+            [SimpleNamespace(done=lambda: False)], active, threading.Lock(), 1, 64, 1, 2
+        )
+
+
+def test_auto_profile_preserves_request_failure():
+    import threading
+    from concurrent.futures import Future
+
+    workload = load("shared_prefix_workload")
+    failed = Future()
+    failed.set_exception(ValueError("original request failure"))
+    with pytest.raises(ValueError, match="original request failure"):
+        workload.wait_for_profile_window(
+            [failed], workload.ActiveStreams(), threading.Lock(), 1, 64, 5, 10
+        )

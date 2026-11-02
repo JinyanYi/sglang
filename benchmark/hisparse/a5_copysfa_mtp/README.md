@@ -31,6 +31,10 @@ Its global concurrency is 64 and per-DP graph batch is 16. The direct launch
 defaults below remain a DP1 diagnostic configuration. Current A5 joint
 runtime acceptance is pending user execution; the earlier donor deployment
 was Q1 with radix disabled and does not establish this MTP/radix behavior.
+After serving checks pass, `AUTO_PROFILE=1 OUTPUT_TOKENS=4096 bash
+benchmark/hisparse/a5_copysfa_mtp/55_steady_decode.sh` automatically waits for
+continuous full client progress, captures without stacks and validates all
+rank traces. See the joint guide for the exact trigger and output paths.
 
 The cross-component address contract is also fixed:
 

@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
+import subprocess
 import threading
 import time
 import urllib.request
@@ -33,9 +35,52 @@ def repeated(values: list[int], size: int) -> list[int]:
 class ActiveStreams(set):
     peak = 0
 
+    def __init__(self):
+        super().__init__()
+        self.progress = {}
+
     def add(self, item):
         super().add(item)
         self.peak = max(self.peak, len(self))
+
+    def discard(self, item):
+        super().discard(item)
+        self.progress.pop(item, None)
+
+
+def wait_for_profile_window(
+    futures, active, lock, target, min_tokens, seconds, timeout
+):
+    """Require concurrent live streams with progress, then validate the real trace."""
+    started = time.monotonic()
+    stable_since = None
+    while True:
+        for future in futures:
+            if future.done():
+                future.result()  # Preserve the original request error, if any.
+                raise RuntimeError("A request finished before the profiling window")
+        now = time.monotonic()
+        with lock:
+            live = len(active)
+            least_tokens = min((active.progress.get(i, 0) for i in active), default=0)
+        if live == target and least_tokens >= min_tokens:
+            if stable_since is None:
+                stable_since = now
+            if now - stable_since >= seconds:
+                return dict(
+                    live_streams=live,
+                    least_completion_tokens=least_tokens,
+                    stable_seconds=now - stable_since,
+                    waited_seconds=now - started,
+                    boundary="Client trigger only; per-rank full batch must pass trace validation",
+                )
+        else:
+            stable_since = None
+        if now - started >= timeout:
+            raise TimeoutError(
+                f"No stable profiling window: live={live}/{target}, min_tokens={least_tokens}/{min_tokens}"
+            )
+        time.sleep(0.1)
 
 
 def stream_one(
@@ -101,6 +146,9 @@ def stream_one(
                 if meta.get("cached_tokens") is not None:
                     cached = int(meta["cached_tokens"])
                 finish = meta.get("finish_reason") or finish
+                if index >= 0 and completion:
+                    with print_lock:
+                        active_requests.progress[index] = completion
     finally:
         with print_lock:
             active_requests.discard(index)
@@ -138,6 +186,11 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--flush", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--profile-root", type=Path)
+    parser.add_argument("--profile-steps", type=int, default=20)
+    parser.add_argument("--profile-warmup-tokens", type=int, default=64)
+    parser.add_argument("--profile-warmup-seconds", type=float, default=5)
+    parser.add_argument("--profile-window-timeout", type=float, default=900)
     args = parser.parse_args()
     if args.dp_size < 1 or args.concurrency < 1 or args.concurrency % args.dp_size:
         parser.error("concurrency must be positive and divisible by dp-size")
@@ -145,6 +198,16 @@ def main() -> int:
         parser.error("num-prompts must cover concurrency and be divisible by dp-size")
     if not 0 < args.suffix_tokens < args.input_tokens:
         parser.error("suffix tokens must be in (0, input tokens)")
+    if args.profile_root and (
+        args.num_prompts != args.concurrency
+        or args.profile_steps < 1
+        or not 0 < args.profile_warmup_tokens < args.output_tokens
+        or args.profile_warmup_seconds < 0
+        or args.profile_window_timeout <= 0
+    ):
+        parser.error(
+            "auto profiling requires one full wave, positive steps/timeout, and warmup below output length"
+        )
 
     from transformers import AutoTokenizer
 
@@ -210,6 +273,38 @@ def main() -> int:
             )
             for index in range(args.num_prompts)
         ]
+        if args.profile_root:
+            args.profile_root.mkdir(parents=True, exist_ok=True)
+            trigger = wait_for_profile_window(
+                futures,
+                active_requests,
+                lock,
+                active_target,
+                args.profile_warmup_tokens,
+                args.profile_warmup_seconds,
+                args.profile_window_timeout,
+            )
+            (args.profile_root / "profile-trigger.json").write_text(
+                json.dumps(trigger, indent=2) + "\n"
+            )
+            print("AUTO_PROFILE_WINDOW " + json.dumps(trigger), flush=True)
+            # Reuse the normal no-stack request, automatic step stop, rank/batch
+            # gate and timeout handling. The server is managed by the user.
+            env = dict(
+                os.environ,
+                RUN_DIR=str(args.profile_root / "capture"),
+                PROFILE_DIR=str(args.profile_root / "profile"),
+                PROFILE_STEPS=str(args.profile_steps),
+            )
+            subprocess.run(
+                ["bash", str(Path(__file__).with_name("60_profile.sh")), "start"],
+                env=env,
+                check=True,
+            )
+            print(
+                f"AUTO_PROFILE_VALIDATED summary={args.profile_root / 'capture/profile-summary.json'}",
+                flush=True,
+            )
         rows = [future.result() for future in futures]
     misses = [
         row["request"]
@@ -233,6 +328,10 @@ def main() -> int:
         "routing": "fixed round robin across primed attention-DP workers",
         "peak_live_client_streams": active_requests.peak,
         "client_streams_are_not_proof_of_server_batch_size": True,
+        "profiled": args.profile_root is not None,
+        "timing_scope": "Includes profiler overhead; use 50_perf.sh for unprofiled performance"
+        if args.profile_root
+        else "Unprofiled client requests",
         "prime": prime,
         "completed": len(rows),
         "total_output_tokens": total,

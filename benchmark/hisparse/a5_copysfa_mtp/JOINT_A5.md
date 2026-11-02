@@ -73,6 +73,7 @@ not A5 runtime validated. No script kills another service automatically.
 ```bash
 cd /mnt/share/y00970600/personal/sglang
 source benchmark/hisparse/a5_copysfa_mtp/article_single_node.env.example
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 bash benchmark/hisparse/a5_copysfa_mtp/40_launch_server.sh --dry-run
 bash benchmark/hisparse/a5_copysfa_mtp/40_launch_server.sh
 ```
@@ -128,7 +129,43 @@ the startup allocation log and trace. Prefix checks run cold/hot on every DP;
 the perf/steady clients prime each worker and explicitly route requests evenly
 to those workers. A single prime request does not warm four independent caches.
 
-## 4. One no-stack capture: terminals B and C
+## 4. Automatic no-stack capture in terminal B
+
+Keep the server running in terminal A. After the prefix checks and unprofiled
+benchmark pass, run this in terminal B; no third terminal or manual trigger is
+required:
+
+```bash
+cd /mnt/share/y00970600/personal/sglang
+source benchmark/hisparse/a5_copysfa_mtp/article_single_node.env.example
+AUTO_PROFILE=1 OUTPUT_TOKENS=4096 PROFILE_STEPS=20 \
+  bash benchmark/hisparse/a5_copysfa_mtp/55_steady_decode.sh
+```
+
+The client primes all four DP workers, routes one wave of 64 long requests
+evenly, and waits until all remain live with at least 64 output tokens each
+for five continuous seconds. It then invokes the same `60_profile.sh start`
+path with `with_stack=false`, automatically stopping after 20 scheduler steps.
+`PROFILE_WARMUP_TOKENS`, `PROFILE_WARMUP_SECONDS` and `PROFILE_WARMUP_TIMEOUT`
+(default900 seconds) control the trigger. A completed/failed request before
+the trigger, a warmup timeout or invalid rank traces produces a nonzero exit.
+Client progress is a trigger only; the trace must still pass the full BS16 and
+20-target-step validation on all eight ranks. Capture failure is preserved,
+without an automatic second capture or changes to the running service.
+
+The stage prints `run_dir=...`. Within that directory:
+
+- `profile-trigger.json`: observed client progress and continuous warmup.
+- `profile/`: raw profiling output.
+- `capture/profile-request.json`: explicit no-stack request receipt.
+- `capture/profile-summary.json`: per-rank completeness and operator accounting.
+- `steady-decode.json`: completed requests, explicitly labeled as profiled.
+
+`AUTO_PROFILE_VALIDATED` means the traces passed the gate; the client then
+finishes its remaining output tokens. Timing from this run includes profiler
+overhead. Keep `50_perf.sh` results as the unprofiled serving measurement.
+
+### Optional manual trigger: terminals B and C
 
 Keep the server's normal launch. Run the sustained workload in B:
 
