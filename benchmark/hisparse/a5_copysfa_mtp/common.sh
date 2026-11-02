@@ -126,6 +126,10 @@ prepend_framework_python() {
 check_checkout() {
   local label="$1"
   local root="$2"
+  if [[ "${SGLANG_SKIP_CHECKOUT_AUDIT:-0}" == 1 ]]; then
+    echo "${label}_checkout_audit=SKIPPED_BY_USER"
+    return 0
+  fi
   local branch origin
   git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
     echo "$label is not a Git worktree: $root" >&2
