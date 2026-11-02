@@ -65,9 +65,12 @@ def main() -> int:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--input-tokens", type=int, default=65536)
     parser.add_argument("--counts", type=int, nargs="+", default=[1, 2, 4])
+    parser.add_argument("--dp-size", type=int, default=1)
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
+    if args.dp_size < 1:
+        parser.error("dp-size must be positive")
     if (
         not args.counts
         or args.counts[0] != 1
@@ -96,7 +99,7 @@ def main() -> int:
                 return body.decode(errors="replace")
             return json.loads(body)
 
-    def request(index):
+    def request(index, rank):
         started = time.monotonic()
         response = post(
             "/generate",
@@ -110,6 +113,7 @@ def main() -> int:
                 "stream": False,
                 "return_logprob": True,
                 "logprob_start_len": -1,
+                **({"routed_dp_rank": rank} if args.dp_size > 1 else {}),
             },
         )
         return {
@@ -121,18 +125,19 @@ def main() -> int:
     flush = post("/flush_cache", {})
     (args.output_dir / "needle_flush.txt").write_text(flush + "\n")
     summary_rows = []
-    cold_text = None
+    cold_text = {}
     for phase_index, count in enumerate(args.counts):
         label = "cold" if phase_index == 0 else f"hot{count}"
+        jobs = [(index, rank) for rank in range(args.dp_size) for index in range(count)]
         with ThreadPoolExecutor(max_workers=count) as pool:
-            rows = list(pool.map(request, range(count)))
+            rows = list(pool.map(lambda job: request(*job), jobs))
         (args.output_dir / f"needle_{label}.json").write_text(
             json.dumps(rows, ensure_ascii=False, indent=2) + "\n"
         )
-        if cold_text is None:
-            cold_text = rows[0]["response"].get("text", "")
-        for row in rows:
+        for (_, rank), row in zip(jobs, rows):
             response = row["response"]
+            if phase_index == 0:
+                cold_text[rank] = response.get("text", "")
             meta = response.get("meta_info") or {}
             text = response.get("text", "")
             cached = meta.get("cached_tokens")
@@ -140,10 +145,11 @@ def main() -> int:
                 {
                     "phase": label,
                     "request": row["index"],
+                    "routed_dp_rank": rank,
                     "contains_nonce": EXPECTED in text,
                     "hot_cache_hit": phase_index == 0
                     or (isinstance(cached, (int, float)) and cached > 0),
-                    "equals_cold_diagnostic": text == cold_text,
+                    "equals_cold_diagnostic": text == cold_text[rank],
                     "text": text,
                     "cached_tokens": cached,
                     "completion_tokens": meta.get("completion_tokens"),
@@ -151,7 +157,12 @@ def main() -> int:
                 }
             )
     passed = all(row["contains_nonce"] and row["hot_cache_hit"] for row in summary_rows)
-    summary = {"passed": passed, "fixture": fixture, "results": summary_rows}
+    summary = {
+        "passed": passed,
+        "attention_dp_size": args.dp_size,
+        "fixture": fixture,
+        "results": summary_rows,
+    }
     (args.output_dir / "needle_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
     )

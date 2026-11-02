@@ -57,6 +57,13 @@ def test_article_windows_and_real_tokens_per_round(tmp_path):
     assert result["article"]["itl_ms"] == pytest.approx(0.02)
     assert result["article"]["tpot_ms"] == pytest.approx(0.02 / 3)
     assert result["article"]["system_tps"] == pytest.approx(16 / (0.02 / 3) * 1000)
+    dp4 = analysis.trace_report(
+        path, 16, 2, [dict(start_us=0, end_us=10), dict(start_us=20, end_us=30)], 3, 4
+    )
+    assert dp4["article"]["system_tps"] == pytest.approx(
+        result["article"]["system_tps"] * 4
+    )
+    assert dp4["article"]["system_tps_assumes_equal_dp_throughput"]
     assert not analysis.trace_report(path, 16, 3)["valid"]
     assert not analysis.trace_report(path, 8, 2)["valid"]
     assert analysis.trace_report(path, 16, 2)["article"]["tpot_ms"] is None
@@ -75,7 +82,8 @@ def test_draft_markers_do_not_count_as_target_steps(tmp_path):
     assert not analysis.trace_report(path, 16, 1)["valid"]
 
 
-def test_completed_stream_does_not_remain_live(monkeypatch):
+@pytest.mark.parametrize("dp_rank", [None, 2])
+def test_completed_stream_does_not_remain_live(monkeypatch, dp_rank):
     import threading
 
     workload = load("shared_prefix_workload")
@@ -90,15 +98,20 @@ def test_completed_stream_does_not_remain_live(monkeypatch):
         def __iter__(self):
             yield b'data: {"meta_info":{"completion_tokens":1,"prompt_tokens":1,"cached_tokens":1}}'
 
-    monkeypatch.setattr(
-        workload.urllib.request, "urlopen", lambda *args, **kwargs: Response()
-    )
+    payloads = []
+
+    def open_request(request, **kwargs):
+        payloads.append(json.loads(request.data))
+        return Response()
+
+    monkeypatch.setattr(workload.urllib.request, "urlopen", open_request)
     active = workload.ActiveStreams()
     workload.stream_one(
-        "http://example.invalid", [1], 1, 1, 0, threading.Lock(), active, 1
+        "http://example.invalid", [1], 1, 1, 0, threading.Lock(), active, 1, dp_rank
     )
     assert len(active) == 0
     assert active.peak == 1
+    assert payloads[0].get("routed_dp_rank") == dp_rank
 
 
 def test_joint_gate_requires_graph_q4_and_rejects_skips(tmp_path):
@@ -125,3 +138,100 @@ def test_joint_gate_requires_graph_q4_and_rejects_skips(tmp_path):
     assert not gate.verify([path])["valid"]
     write(names, skipped=1)
     assert not gate.verify([path])["valid"]
+
+
+def test_runtime_gate_rejects_reduced_capacity_and_disabled_graph():
+    checker = load("check_server_state")
+    state = dict(
+        tp_size=8,
+        attn_dp_size=4,
+        dp_size=1,
+        ep_size=8,
+        pp_size=1,
+        attn_cp_size=1,
+        effective_max_running_requests_per_dp=16,
+        disable_radix_cache=False,
+        kv_cache_dtype="fp8_e4m3",
+        speculative_algorithm="EAGLE",
+        speculative_num_steps=3,
+        speculative_eagle_topk=1,
+        speculative_num_draft_tokens=4,
+        cuda_graph_config={"decode": {"backend": "full", "bs": [16]}},
+        decode_cuda_graph_bs=[16],
+    )
+    info = {"internal_states": [dict(state) for _ in range(4)]}
+    kwargs = dict(tp=8, dp=4, ep=8, batch=16, mtp=1, graph=1)
+    assert checker.validate(info, **kwargs) == []
+    info["internal_states"][2]["effective_max_running_requests_per_dp"] = 6
+    assert any(
+        "effective_max_running" in error for error in checker.validate(info, **kwargs)
+    )
+    info["internal_states"][2]["effective_max_running_requests_per_dp"] = 16
+    info["internal_states"][2]["cuda_graph_config"] = {
+        "decode": {"backend": "disabled"}
+    }
+    assert any("graph backend" in error for error in checker.validate(info, **kwargs))
+    assert checker.validate({"internal_states": [state]}, **kwargs)
+
+
+def test_dp_workload_primes_and_routes_every_worker(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    workload = load("shared_prefix_workload")
+    calls = []
+
+    def stream(url, ids, output, timeout, index, lock, active, target, dp_rank=None):
+        calls.append((index, dp_rank))
+        return dict(
+            request=index,
+            completion_tokens=output,
+            cached_tokens=128,
+            ttft_seconds=0.1,
+            tpot_seconds=0.001,
+            routed_dp_rank=dp_rank,
+        )
+
+    monkeypatch.setattr(workload, "stream_one", stream)
+    monkeypatch.setattr(workload, "post", lambda *args: b"ok")
+    tokenizer = SimpleNamespace(encode=lambda *args, **kwargs: [1, 2])
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            AutoTokenizer=SimpleNamespace(
+                from_pretrained=lambda *args, **kwargs: tokenizer
+            )
+        ),
+    )
+
+    def metrics(*args, **kwargs):
+        raise RuntimeError("No metrics endpoint in CPU test")
+
+    monkeypatch.setattr(workload.urllib.request, "urlopen", metrics)
+    output = tmp_path / "report.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "workload",
+            "--model-path",
+            "unused",
+            "--input-tokens",
+            "256",
+            "--suffix-tokens",
+            "128",
+            "--num-prompts",
+            "8",
+            "--concurrency",
+            "8",
+            "--dp-size",
+            "4",
+            "--output",
+            str(output),
+        ],
+    )
+    assert workload.main() == 0
+    assert calls[:4] == [(-1, rank) for rank in range(4)]
+    assert sorted(calls[4:]) == [(index, index % 4) for index in range(8)]
+    assert json.loads(output.read_text())["concurrency_per_dp"] == 2

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+configure_topology
 
 ACTION="${1:-start}"
 [[ "$ACTION" == start || "$ACTION" == stop ]] || {
@@ -15,6 +16,7 @@ if [[ "$ACTION" == stop ]]; then
     --base-url "$BASE_URL"
   exit 0
 fi
+verify_running_server
 
 PROFILE_DIR="${PROFILE_DIR:-$RUN_DIR/profile}"
 PROFILE_STEPS="${PROFILE_STEPS:-20}"
@@ -30,7 +32,8 @@ deadline=$((SECONDS + PROFILE_TIMEOUT))
 while true; do
   if "$PYTHON_BIN" "$HANDOFF_DIR/analyze_profile.py" "$PROFILE_DIR" \
       --output "$RUN_DIR/profile-summary.json" \
-      --require-joint --expected-ranks "${TP_SIZE:-8}" --batch "${CONCURRENCY:-16}" \
+      --require-joint --expected-ranks "$TP_SIZE" --batch "$PER_DP_BATCH_SIZE" \
+      --dp-size "$ATTN_DP_SIZE" \
       --min-steps "${PROFILE_MIN_STEPS:-$PROFILE_STEPS}" \
       > "$RUN_DIR/profile-validation.log" 2>&1; then
     cat "$RUN_DIR/profile-validation.log"

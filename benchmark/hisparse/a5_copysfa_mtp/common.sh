@@ -22,6 +22,50 @@ require_value() {
   [[ -n "${!name:-}" ]] || { echo "Set $name before running this stage." >&2; return 2; }
 }
 
+configure_topology() {
+  TP_SIZE="${TP_SIZE:-8}"
+  ATTN_DP_SIZE="${ATTN_DP_SIZE:-1}"
+  EP_SIZE="${EP_SIZE:-$TP_SIZE}"
+  PER_DP_BATCH_SIZE="${PER_DP_BATCH_SIZE:-16}"
+  local name
+  for name in TP_SIZE ATTN_DP_SIZE EP_SIZE PER_DP_BATCH_SIZE; do
+    [[ "${!name}" =~ ^[1-9][0-9]*$ ]] || { echo "$name must be positive" >&2; return 2; }
+  done
+  (( TP_SIZE % ATTN_DP_SIZE == 0 && TP_SIZE % EP_SIZE == 0 )) || {
+    echo "TP_SIZE must be divisible by ATTN_DP_SIZE and EP_SIZE" >&2; return 2;
+  }
+  MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-$((ATTN_DP_SIZE * PER_DP_BATCH_SIZE))}"
+  GRAPH_BATCH_SIZE="${GRAPH_BATCH_SIZE:-$PER_DP_BATCH_SIZE}"
+  CONCURRENCY="${CONCURRENCY:-$MAX_RUNNING_REQUESTS}"
+  for name in MAX_RUNNING_REQUESTS GRAPH_BATCH_SIZE CONCURRENCY; do
+    [[ "${!name}" =~ ^[1-9][0-9]*$ ]] || { echo "$name must be positive" >&2; return 2; }
+  done
+  (( MAX_RUNNING_REQUESTS == ATTN_DP_SIZE * PER_DP_BATCH_SIZE )) || {
+    echo "MAX_RUNNING_REQUESTS is global: expected ATTN_DP_SIZE * PER_DP_BATCH_SIZE" >&2; return 2;
+  }
+  (( GRAPH_BATCH_SIZE == PER_DP_BATCH_SIZE )) || {
+    echo "GRAPH_BATCH_SIZE must equal PER_DP_BATCH_SIZE for this controlled run" >&2; return 2;
+  }
+  export TP_SIZE ATTN_DP_SIZE EP_SIZE PER_DP_BATCH_SIZE
+  export MAX_RUNNING_REQUESTS GRAPH_BATCH_SIZE CONCURRENCY
+}
+
+configure_deepep_environment() {
+  local package
+  package="$("$PYTHON_BIN" -c 'from importlib.metadata import distribution; print(distribution("deep_ep").locate_file("deep_ep"))')" || return $?
+  require_dir "$package/vendors/hwcomputing" || return $?
+  export PYTHONPATH="$package${PYTHONPATH:+:$PYTHONPATH}"
+  export LD_LIBRARY_PATH="$package/vendors/hwcomputing/op_api/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  export ASCEND_CUSTOM_OPP_PATH="$package/vendors/hwcomputing${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
+}
+
+verify_running_server() {
+  run_logged server-state "$PYTHON_BIN" "$HANDOFF_DIR/check_server_state.py" \
+    --base-url "${BASE_URL:-http://127.0.0.1:${PORT:-30000}}" \
+    --tp "$TP_SIZE" --dp "$ATTN_DP_SIZE" --ep "$EP_SIZE" --batch "$PER_DP_BATCH_SIZE" \
+    --mtp "${MTP:-1}" --graph "${GRAPH:-1}" --output "$RUN_DIR/server-state.json"
+}
+
 init_stage() {
   local stage="$1"
   local stamp

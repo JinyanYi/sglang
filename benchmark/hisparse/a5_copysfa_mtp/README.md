@@ -20,6 +20,17 @@ the existing metadata fusions. See [JOINT_A5.md](JOINT_A5.md) for the current
 build, real LIM-to-CopySFA graph/Q4/fusion tests, manual serving and no-stack
 profiling workflow. Rebuild/install this wheel before model-mode preflight;
 leave `SGLANG_NPU_A5_LIM_LIBRARY` unset. The OPP is activated before NPU init.
+The LIM donor branch name ends in `10-30`, but its integrated HEAD `e53e8d8`
+was committed on October 31. It includes the original-OPP/SIMT restoration
+`84fa315`, rather than the earlier direct LIM migration. See
+`tools/a5_c8/INTEGRATION.json` in the paired kernel checkout for exact provenance.
+
+For the current **40K, C12288, attention DP4/TP2, EP8, MTP3 + graph** launch,
+source `article_single_node.env.example` and follow [JOINT_A5.md](JOINT_A5.md).
+Its global concurrency is 64 and per-DP graph batch is 16. The direct launch
+defaults below remain a DP1 diagnostic configuration. Current A5 joint
+runtime acceptance is pending user execution; the earlier donor deployment
+was Q1 with radix disabled and does not establish this MTP/radix behavior.
 
 The cross-component address contract is also fixed:
 
@@ -73,16 +84,15 @@ bash ./benchmark/hisparse/a5_copysfa_mtp/00_preflight.sh copy
 bash ./benchmark/hisparse/a5_copysfa_mtp/20_test_cpu.sh
 ```
 
-Run standalone A5 CopySFA numerical tests first. After the colleague's LIM
-package is installed into the same private interpreter, repeat model preflight
-and the A5 framework tests. `copy` mode covers CopySFA and packed-tail metadata
-without LIM. `model` mode additionally runs the real external-LIM contract case
-with a deterministic high-score tail and odd-page prefix; missing LIM is a hard
-failure, not a skip:
+Run standalone A5 CopySFA numerical tests first if needed. The current combined
+wheel already contains McZyWu's original LIM; no separate LIM wheel or DSO is
+required. `copy` mode covers CopySFA and packed-tail metadata without invoking
+LIM. `model` mode additionally runs the real LIM contract and the four joint
+Q1/Q4 eager/graph fusion cases; missing LIM is a hard failure, not a skip:
 
 ```bash
 bash ./benchmark/hisparse/a5_copysfa_mtp/30_test_a5.sh copy
-export SGLANG_NPU_A5_LIM_LIBRARY=/path/to/lim-only.so  # omit for a combined wheel
+unset SGLANG_NPU_A5_LIM_LIBRARY
 bash ./benchmark/hisparse/a5_copysfa_mtp/00_preflight.sh model
 bash ./benchmark/hisparse/a5_copysfa_mtp/30_test_a5.sh model
 ```

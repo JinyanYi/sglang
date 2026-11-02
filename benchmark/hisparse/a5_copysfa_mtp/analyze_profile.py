@@ -194,6 +194,7 @@ def trace_report(
                 tpot_ms=tpot,
                 per_dp_tps=batch / tpot * 1000,
                 system_tps=batch / tpot * 1000 * dp_size,
+                system_tps_assumes_equal_dp_throughput=dp_size > 1,
             )
             result["missing_article_inputs"] = []
         result["article"]["other_definition"] = (
@@ -261,6 +262,8 @@ def main():
         and all(row["valid"] for row in reports),
         expected_rank_files=args.expected_ranks,
         actual_rank_files=len(reports),
+        attention_dp_size=args.dp_size,
+        batch_per_dp=args.batch,
         method="Offload.txt section5.1.4; ITL/tokens_per_round=TPOT; batch/TPOT*1000=per-DP TPS; sum independent DP, do not multiply by TP",
         logical_rank_mapping="Trace paths retained; verify rank/device identities with server logs",
         traces=reports,

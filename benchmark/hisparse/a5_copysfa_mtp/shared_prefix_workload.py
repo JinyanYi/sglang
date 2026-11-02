@@ -47,6 +47,7 @@ def stream_one(
     print_lock,
     active_requests,
     active_target,
+    dp_rank=None,
 ):
     request = urllib.request.Request(
         url,
@@ -59,6 +60,7 @@ def stream_one(
                     "ignore_eos": True,
                 },
                 "stream": True,
+                **({"routed_dp_rank": dp_rank} if dp_rank is not None else {}),
             }
         ).encode(),
         headers={"Content-Type": "application/json"},
@@ -112,6 +114,7 @@ def stream_one(
         raise RuntimeError(f"request {index} prompt={prompt}, expected={len(ids)}")
     return {
         "request": index,
+        "routed_dp_rank": dp_rank,
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "cached_tokens": cached,
@@ -131,10 +134,15 @@ def main() -> int:
     parser.add_argument("--suffix-tokens", type=int, default=128)
     parser.add_argument("--num-prompts", type=int, default=72)
     parser.add_argument("--concurrency", type=int, default=16)
+    parser.add_argument("--dp-size", type=int, default=1)
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--flush", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.dp_size < 1 or args.concurrency < 1 or args.concurrency % args.dp_size:
+        parser.error("concurrency must be positive and divisible by dp-size")
+    if args.num_prompts < args.concurrency or args.num_prompts % args.dp_size:
+        parser.error("num-prompts must cover concurrency and be divisible by dp-size")
     if not 0 < args.suffix_tokens < args.input_tokens:
         parser.error("suffix tokens must be in (0, input tokens)")
 
@@ -160,16 +168,22 @@ def main() -> int:
     lock = threading.Lock()
     active_requests = ActiveStreams()
     active_target = min(args.num_prompts, args.concurrency)
-    prime = stream_one(
-        base + "/generate",
-        ids(-1),
-        1,
-        args.timeout,
-        -1,
-        lock,
-        active_requests,
-        active_target,
-    )
+    # Radix caches belong to individual attention-DP workers. Prime every
+    # worker and route measured requests evenly to those exact workers.
+    prime = [
+        stream_one(
+            base + "/generate",
+            ids(-1),
+            1,
+            args.timeout,
+            -1,
+            lock,
+            active_requests,
+            active_target,
+            rank if args.dp_size > 1 else None,
+        )
+        for rank in range(args.dp_size)
+    ]
 
     def metrics_snapshot(name):
         try:
@@ -192,6 +206,7 @@ def main() -> int:
                 lock,
                 active_requests,
                 active_target,
+                index % args.dp_size if args.dp_size > 1 else None,
             )
             for index in range(args.num_prompts)
         ]
@@ -213,6 +228,9 @@ def main() -> int:
         "output_tokens_per_request": args.output_tokens,
         "num_prompts": args.num_prompts,
         "concurrency": args.concurrency,
+        "attention_dp_size": args.dp_size,
+        "concurrency_per_dp": args.concurrency // args.dp_size,
+        "routing": "fixed round robin across primed attention-DP workers",
         "peak_live_client_streams": active_requests.peak,
         "client_streams_are_not_proof_of_server_batch_size": True,
         "prime": prime,
