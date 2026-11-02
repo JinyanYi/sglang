@@ -90,7 +90,7 @@ A ready endpoint is not model acceptance. Repeat manually with MTP/GRAPH
 Stop only your own server between configurations. Quantization defaults to
 modelslim; adjust `QUANTIZATION` only for the model actually being loaded.
 The preset uses the supplied checkpoint directory
-`/mnt/share/w00936111/GLM-5/2-W4A4C8-mxfp4-A5-0731`; its actual model identity
+`/mnt/share/w00936111/GLM-5.2-W4A4C8-mxfp4-A5-0731`; its actual model identity
 and MTP head count still need checking from that directory's `config.json`.
 The agent cannot inspect this A5-only directory. Keep model weights unchanged.
 
@@ -231,3 +231,23 @@ null and lists missing inputs. Compare unprofiled serving throughput separately.
 
 Next acceptance order: joint graph/Q4/fusion tests, four model combinations
 with radix, unprofiled throughput, then this single no-stack profiling capture.
+
+## Missing DeepEP V2 ACLNN symbols during graph capture
+
+If graph capture reports `aclnnMoeLowLatencyDispatchV2` or its workspace
+function missing, inspect library lookup before changing memory sizing or
+graph/MTP settings. DeepEP's adapter uses a bare `libcust_opapi.so` handle;
+the original LIM also installs that filename, and activation currently places
+its library directory first. This is a source-level collision risk, not yet
+proof of which DSO the failed A5 process selected. The existing DeepEP wheel
+could also lack matching operators or dependencies. The kernel-only build
+intentionally leaves the installed DeepEP wheel unchanged.
+
+Run `bash benchmark/hisparse/a5_copysfa_mtp/37_check_deepep.sh` after sourcing
+the same article environment. It imports the original LIM, resolves its DSO,
+then compares the absolute DeepEP vendor library against the bare-name and
+standard-library lookup. It records paths, hashes, versions, import errors and
+both V2 dispatch/combine API pairs. It does not load the model or execute NPU
+operators. The import order is explicit in its report; this is a probe, not
+an assertion about the exact import order of the earlier failed server.
+The complete report is in the printed run directory's `libraries.log`.
