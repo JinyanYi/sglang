@@ -138,7 +138,8 @@ check_checkout() {
     echo "$label must be on $EXPECTED_BRANCH, got $branch" >&2
     return 2
   }
-  [[ "$origin" == "https://github.com/JinyanYi/"* ]] || {
+  # GitHub owner names are case-insensitive; retain the raw URL in receipts.
+  [[ "${origin,,}" == "https://github.com/jinyanyi/"* ]] || {
     echo "$label origin is not the expected personal fork: $origin" >&2
     return 2
   }
