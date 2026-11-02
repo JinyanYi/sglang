@@ -260,10 +260,39 @@ bash benchmark/hisparse/a5_copysfa_mtp/11_rebuild_deepep_bridge.sh
 This script saves the currently installed DeepEP vendor and a complete file
 hash manifest, rebuilds the bridge with that exact vendor (no device-kernel
 compilation), installs only the new DeepEP wheel with `--no-deps`, and verifies
-the installed vendor hashes and existing `libsgl_kernel_npu.so` are unchanged.
+the installed vendor payload hashes and existing `libsgl_kernel_npu.so` are
+unchanged. Generated `__pycache__/*.pyc` differences are reported separately
+only when their corresponding `.py` source exists and has the same hash on
+both sides; all libraries, device binaries, Python sources and configuration
+remain protected. Source staging remains a strict whole-tree copy check.
 The installed DeepEP baseline `a5c12d19` has the same device sources as this
 branch. Do not run `10_build_kernel.sh` for this loader repair. The repaired
-bridge still requires an A5 build and actual joint serving validation.
+bridge requires actual joint serving validation after installation.
+
+### Resume after installation succeeded but vendor comparison failed
+
+The user A5 build of `deep_ep-1.0.0+65f40530.cann.9.1.0.b243` completed and
+installed successfully, then the old whole-tree comparison returned
+`ValueError: DeepEP vendor bytes changed`. A CPU reproduction with the same
+setup script shows that pip creates vendor Python bytecode during install.
+The new comparison emits added/missing/changed paths and a complete JSON
+receipt, retaining strict payload checks. The actual failed run's differences
+must still be checked; the generic old exception alone does not identify them.
+
+Keep the original build directory and resume from its saved vendor baseline:
+
+```bash
+export RECOVERY_DIR=/path/to/original-rebuild-deepep-bridge-run
+bash benchmark/hisparse/a5_copysfa_mtp/12_resume_deepep_verification.sh
+```
+
+This does not rebuild or reinstall anything. It validates the saved wheel,
+checks the backup against its original `vendor.before.json`, compares the
+installed payload, checks the original kernel SO and runs both import-order
+probes. It writes a new run directory and `vendor-comparison.json`, leaving
+the failed run's logs/exit codes unchanged. A protected payload difference
+still stops the workflow. Do not rerun the build just to create a new baseline
+from the already replaced package.
 
 Run `bash benchmark/hisparse/a5_copysfa_mtp/37_check_deepep.sh` after sourcing
 the same article environment. It checks LIM-first and DeepEP-first in separate

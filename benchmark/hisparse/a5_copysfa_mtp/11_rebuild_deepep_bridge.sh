@@ -21,6 +21,7 @@ mapfile -d '' wheels < <(find "$KERNEL_ROOT/output" -maxdepth 1 -type f \
 sha256sum "${wheels[0]}" | tee "$RUN_DIR/deepep-wheel.sha256"
 run_logged install "$PYTHON_BIN" -m pip install --force-reinstall --no-deps "${wheels[0]}"
 vendor="$("$PYTHON_BIN" -c 'from importlib.metadata import distribution; print(distribution("deep_ep").locate_file("deep_ep/vendors/hwcomputing"))')"
-run_logged vendor_unchanged "$PYTHON_BIN" "$helper" --source "$SGL_DEEPEP_PREBUILT_VENDOR" --compare "$vendor"
+run_logged vendor_unchanged "$PYTHON_BIN" "$helper" --source "$SGL_DEEPEP_PREBUILT_VENDOR" --compare "$vendor" \
+  --baseline-receipt "$RUN_DIR/vendor.before.json" --receipt "$RUN_DIR/vendor-comparison.json"
 run_logged kernel_unchanged sha256sum -c "$RUN_DIR/kernel.before.sha256"
 RUN_DIR="$RUN_DIR/verify" bash "$HANDOFF_DIR/37_check_deepep.sh"
