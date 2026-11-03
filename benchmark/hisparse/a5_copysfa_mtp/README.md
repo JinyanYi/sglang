@@ -236,3 +236,8 @@ For a native draft LI warmup segfault, see [input snapshots and isolated replay]
 To analyze a completed capture locally and paste a compact text report, use
 [`66_article_report.sh CASE_ROOT`](ARTICLE_REPORT.md). It separates target and
 draft graphs and labels the article's three-token assumption and graph proxies.
+
+For measured serving comparisons against the same SGLang version without
+offload, use [`41_launch_no_offload.sh`](NO_OFFLOAD.md). Table 7's BS7 reference
+uses graph bucket 8 with seven real requests per DP; a BS16 same-concurrency
+test is also supported. `50_perf.sh` remains the primary performance result.

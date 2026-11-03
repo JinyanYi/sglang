@@ -3,6 +3,7 @@ set -euo pipefail
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 configure_topology
+configure_profile_mode
 
 ACTION="${1:-start}"
 [[ "$ACTION" == start || "$ACTION" == stop ]] || {
@@ -32,7 +33,7 @@ deadline=$((SECONDS + PROFILE_TIMEOUT))
 while true; do
   if "$PYTHON_BIN" "$HANDOFF_DIR/analyze_profile.py" "$PROFILE_DIR" \
       --output "$RUN_DIR/profile-summary.json" \
-      --require-joint --expected-ranks "$TP_SIZE" --batch "$PER_DP_BATCH_SIZE" \
+      "${PROFILE_MODE_ARGS[@]}" --expected-ranks "$TP_SIZE" --batch "$PER_DP_BATCH_SIZE" \
       --dp-size "$ATTN_DP_SIZE" \
       --min-steps "${PROFILE_MIN_STEPS:-$PROFILE_STEPS}" \
       > "$RUN_DIR/profile-validation.log" 2>&1; then

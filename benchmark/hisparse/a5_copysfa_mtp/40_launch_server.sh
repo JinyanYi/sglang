@@ -16,6 +16,8 @@ QUANTIZATION="${QUANTIZATION:-modelslim}"
 SPARSE_CACHE_SIZE="${SPARSE_CACHE_SIZE:-16384}"
 GRAPH="${GRAPH:-1}"
 MTP="${MTP:-1}"
+KV_OFFLOAD="${KV_OFFLOAD:-1}"
+configure_kv_policy
 DEEPEP_MODE="${DEEPEP_MODE:-auto}"
 export DEEPEP_HYBRID_DEPLOYMENT="${DEEPEP_HYBRID_DEPLOYMENT:-1}"
 export HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-1000}"
@@ -25,7 +27,9 @@ for name in PORT TP_SIZE EP_SIZE MAX_RUNNING_REQUESTS CONTEXT_LENGTH CHUNKED_PRE
 done
 [[ "$GRAPH" == 0 || "$GRAPH" == 1 ]] || { echo "GRAPH must be 0 or 1" >&2; exit 2; }
 [[ "$MTP" == 0 || "$MTP" == 1 ]] || { echo "MTP must be 0 or 1" >&2; exit 2; }
-dispatch_min=$((PER_DP_BATCH_SIZE * (1 + 3 * MTP)))
+dispatch_batch="$PER_DP_BATCH_SIZE"
+(( GRAPH == 0 )) || dispatch_batch="$GRAPH_BATCH_SIZE"
+dispatch_min=$((dispatch_batch * (1 + 3 * MTP)))
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-$dispatch_min}"
 [[ "$DEEPEP_MODE" == auto && "$DEEPEP_HYBRID_DEPLOYMENT" == 1 ]] || {
   echo "This joint launcher requires DeepEP auto + hybrid" >&2; exit 2;
@@ -34,10 +38,12 @@ export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${SGLANG_DEEPEP_NUM_MAX_D
   (( SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK >= dispatch_min && SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK <= 1024 )) || {
   echo "DeepEP dispatch capacity must cover per-DP padded Q tokens ($dispatch_min), at most 1024" >&2; exit 2;
 }
-(( SPARSE_CACHE_SIZE >= 8192 && SPARSE_CACHE_SIZE <= 32384 && SPARSE_CACHE_SIZE % 128 == 0 )) || {
+if (( KV_OFFLOAD )); then
+  (( SPARSE_CACHE_SIZE >= 8192 && SPARSE_CACHE_SIZE <= 32384 && SPARSE_CACHE_SIZE % 128 == 0 )) || {
   echo "A5 Q4 SPARSE_CACHE_SIZE must be a 128-aligned value in [8192, 32384]" >&2
   exit 2
-}
+  }
+fi
 
 args=("$PYTHON_BIN" -m sglang.launch_server
   --model-path "$MODEL_PATH" --served-model-name "$SERVED_MODEL_NAME"
@@ -65,7 +71,7 @@ fi
 
 if [[ "${1:-}" == --dry-run ]]; then
   printf 'world=%s attention_DP=%s attention_TP=%s EP=%s per_DP_batch=%s global_requests=%s graph_bucket=%s DeepEP_dispatch_capacity=%s\n' "$TP_SIZE" "$ATTN_DP_SIZE" "$((TP_SIZE / ATTN_DP_SIZE))" "$EP_SIZE" "$PER_DP_BATCH_SIZE" "$MAX_RUNNING_REQUESTS" "$GRAPH_BATCH_SIZE" "$SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"
-  printf 'radix=enabled target_offload=lim+copysfa kv_cache=fp8_e4m3 C=%s metadata_fusions=1 MTP=%s GRAPH=%s draft_offload=disabled profile=off\n' "$SPARSE_CACHE_SIZE" "$MTP" "$GRAPH"
+  printf 'radix=enabled KV_OFFLOAD=%s indexer=%s copy_sfa=%s metadata_fusions=%s MTP=%s GRAPH=%s draft_offload=disabled profile=off\n' "$KV_OFFLOAD" "$SGLANG_NPU_SPARSE_KV_INDEXER" "$SGLANG_NPU_ENABLE_COPY_SFA" "$SGLANG_NPU_FUSED_LIM_PRE_METADATA" "$MTP" "$GRAPH"
   printf '%q ' "${args[@]}"
   printf '\n'
   exit 0
@@ -85,14 +91,9 @@ configure_deepep_environment
 activate_joint_opp
 export FRAMEWORK_ROOT
 
-# C8 offload is target-only. The draft worker retains its native HBM KV pool;
-# the packed target additionally owns a circular 256-token device tail.
-export SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD=1
-export SGLANG_NPU_SPARSE_KV_INDEXER=lim
-export SGLANG_NPU_ENABLE_COPY_SFA=1
-export SGLANG_NPU_SPARSE_KV_CACHE_SIZE="$SPARSE_CACHE_SIZE"
-export SGLANG_NPU_FUSED_LIM_PRE_METADATA=1
-export SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA=1
+# Offload, when enabled, is target-only; draft KV remains in HBM in both modes.
+# configure_kv_policy already set every sparse switch explicitly, including
+# the native baseline case, before Python can cache environment values.
 export SGLANG_NPU_PROFILING=0
 export SGLANG_NPU_USE_MLAPO=0
 export TRANSFORMERS_VERBOSITY="${TRANSFORMERS_VERBOSITY:-error}"
@@ -102,9 +103,13 @@ mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
 
 printf 'world=%s attention_DP=%s attention_TP=%s EP=%s per_DP_batch=%s global_requests=%s graph_bucket=%s MTP=%s GRAPH=%s DeepEP_dispatch_capacity=%s HCCL_BUFFSIZE=%s\n' \
   "$TP_SIZE" "$ATTN_DP_SIZE" "$((TP_SIZE / ATTN_DP_SIZE))" "$EP_SIZE" "$PER_DP_BATCH_SIZE" "$MAX_RUNNING_REQUESTS" "$GRAPH_BATCH_SIZE" "$MTP" "$GRAPH" "$SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK" "$HCCL_BUFFSIZE" | tee "$RUN_DIR/topology.log"
+printf 'KV_OFFLOAD=%s indexer=%s copy_sfa=%s metadata_fusions=%s\n' \
+  "$KV_OFFLOAD" "$SGLANG_NPU_SPARSE_KV_INDEXER" "$SGLANG_NPU_ENABLE_COPY_SFA" "$SGLANG_NPU_FUSED_LIM_PRE_METADATA" | tee "$RUN_DIR/kv-policy.log"
 
 run_logged deepep_libraries "$PYTHON_BIN" "$HANDOFF_DIR/check_deepep_libraries.py"
-run_logged preflight "$PYTHON_BIN" "$HANDOFF_DIR/preflight.py" --mode model
+preflight_mode=model
+(( KV_OFFLOAD != 0 )) || preflight_mode=copy
+run_logged preflight "$PYTHON_BIN" "$HANDOFF_DIR/preflight.py" --mode "$preflight_mode"
 printf '%q ' "${args[@]}" | tee "$RUN_DIR/server.command"
 printf '\n' | tee -a "$RUN_DIR/server.command"
 run_logged server "${args[@]}"

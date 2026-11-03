@@ -215,7 +215,9 @@ def main():
         type=Path,
         help="CSV: trace,start_us,end_us; trace is the relative path under profile_dir",
     )
-    parser.add_argument("--require-joint", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--require-joint", action="store_true")
+    mode.add_argument("--no-offload", action="store_true")
     parser.add_argument("--tokens-per-round", type=float)
     parser.add_argument("--dp-size", type=int, default=1)
     args = parser.parse_args()
@@ -256,6 +258,16 @@ def main():
                 row["valid"]
                 and counts.get("LIM", 0) > 0
                 and counts.get("CopySFA", 0) > 0
+            )
+    if args.no_offload:
+        for row in reports:
+            counts = row.get("component_kernel_counts", {})
+            row["valid"] = (
+                row["valid"]
+                and counts.get("LIM", 0) == 0
+                and counts.get("CopySFA", 0) == 0
+                and counts.get("LI", 0) > 0
+                and counts.get("SFA", 0) > 0
             )
     result = dict(
         valid=len(reports) == args.expected_ranks

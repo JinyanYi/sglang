@@ -17,6 +17,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("log", type=Path)
     parser.add_argument("--mtp", type=int, choices=(0, 1), default=1)
+    parser.add_argument("--offload", type=int, choices=(0, 1), default=1)
     args = parser.parse_args()
     text = args.log.read_text(errors="replace")
     records = [
@@ -35,8 +36,14 @@ def main() -> int:
         raise RuntimeError(
             "Every draft allocation must have offload=False and positive CKV bytes"
         )
-    if not targets or not all(offload for _, offload, _, _, _ in targets):
-        raise RuntimeError("Every target allocation must have offload=True")
+    if not targets or not all(
+        offload == bool(args.offload) for _, offload, _, _, _ in targets
+    ):
+        raise RuntimeError(
+            f"Every target allocation must have offload={bool(args.offload)}"
+        )
+    if not args.offload and not all(ckv > 0 for _, _, ckv, _, _ in targets):
+        raise RuntimeError("Native target KV must have positive HBM CKV bytes")
     for record in records:
         print(record[-1])
     return 0

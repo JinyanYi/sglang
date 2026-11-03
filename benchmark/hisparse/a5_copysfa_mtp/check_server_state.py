@@ -9,7 +9,7 @@ import urllib.request
 from pathlib import Path
 
 
-def validate(info, *, tp, dp, ep, batch, mtp, graph):
+def validate(info, *, tp, dp, ep, batch, mtp, graph, graph_batch=None):
     errors = []
     states = info.get("internal_states", [])
     if len(states) != dp:
@@ -53,9 +53,10 @@ def validate(info, *, tp, dp, ep, batch, mtp, graph):
                 f"DP state {index}: decode graph backend={backend!r}, GRAPH={graph}"
             )
         buckets = state.get("decode_cuda_graph_bs") or decode.get("bs") or []
-        if graph and batch not in buckets:
+        expected_bucket = graph_batch if graph_batch is not None else batch
+        if graph and (expected_bucket < batch or expected_bucket not in buckets):
             errors.append(
-                f"DP state {index}: graph buckets do not contain per-DP batch {batch}"
+                f"DP state {index}: graph buckets do not contain requested bucket {expected_bucket} covering live batch {batch}"
             )
     return errors
 
@@ -69,6 +70,7 @@ def main():
     parser.add_argument("--batch", type=int, required=True)
     parser.add_argument("--mtp", type=int, choices=(0, 1), required=True)
     parser.add_argument("--graph", type=int, choices=(0, 1), required=True)
+    parser.add_argument("--graph-batch", type=int)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -84,6 +86,7 @@ def main():
         batch=args.batch,
         mtp=args.mtp,
         graph=args.graph,
+        graph_batch=args.graph_batch,
     )
     summary = dict(
         status="fail" if errors else "pass",
@@ -96,6 +99,7 @@ def main():
         global_requests=args.batch * args.dp,
         mtp=args.mtp,
         graph=args.graph,
+        graph_bucket=args.graph_batch or args.batch,
         boundary="Resolved configuration and scheduler capacity; not model accuracy or proof of graph replay",
     )
     args.output.write_text(
