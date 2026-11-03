@@ -77,7 +77,7 @@ def describe_call(args, torch):
     return result
 
 
-def snapshot_draft_li(args, batch, backend, layer_id, directory):
+def snapshot_draft_li(args, batch, backend, layer_id, directory, operator=None):
     import torch
     import torch_npu
 
@@ -105,6 +105,7 @@ def snapshot_draft_li(args, batch, backend, layer_id, directory):
     print(f"[quant-li-debug] {path} before_sync", flush=True)
     torch.npu.synchronize()
     report.update(runtime_info(torch, torch_npu))
+    report["selected_callable"] = str(operator)
     report["stage"] = "synchronized_before_native_li"
     report["inputs"] = describe_call(args, torch)
     write_json(path, report)
@@ -126,7 +127,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--binding", choices=("custom", "torch-npu"), required=True)
+    parser.add_argument(
+        "--binding", choices=("custom", "torch-npu", "npu-dispatch"), required=True
+    )
     parser.add_argument("--graph", action="store_true")
     options = parser.parse_args()
     options.output.parent.mkdir(parents=True, exist_ok=True)
@@ -136,13 +139,19 @@ def main():
     import torch_npu
 
     # Separate processes are essential: custom_ops may replace registrations.
-    if options.binding == "custom":
+    if options.binding in ("custom", "npu-dispatch"):
         import custom_ops  # noqa: F401
         import sgl_kernel_npu  # noqa: F401
 
     torch.npu.set_device(0)
     torch.npu.set_compile_mode(jit_compile=False)
     report.update(runtime_info(torch, torch_npu))
+    operator = (
+        torch.ops.npu.npu_quant_lightning_indexer
+        if options.binding == "npu-dispatch"
+        else torch_npu.npu_quant_lightning_indexer
+    )
+    report["selected_callable"] = str(operator)
     payload = torch.load(options.fixture, map_location="cpu", weights_only=True)
     args = {
         name: value.to("npu:0") if torch.is_tensor(value) else value
@@ -157,14 +166,14 @@ def main():
     report["stage"] = "before_native_li"
     write_json(options.output, report)
     print(json.dumps(report, indent=2), flush=True)
-    output = torch_npu.npu_quant_lightning_indexer(**args)
+    output = operator(**args)
     torch.npu.synchronize()
     if options.graph:
         graph = torch.npu.NPUGraph()
         report["stage"] = "before_graph_capture"
         write_json(options.output, report)
         with torch.npu.graph(graph):
-            output = torch_npu.npu_quant_lightning_indexer(**args)
+            output = operator(**args)
         graph.replay()
         torch.npu.synchronize()
     outputs = output if isinstance(output, (tuple, list)) else [output]

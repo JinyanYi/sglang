@@ -23,6 +23,14 @@ if is_npu():
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 
+def _get_npu_quant_lightning_indexer(query):
+    # Recipes custom_ops can replace torch_npu's public Python entry point.
+    # FP8 LI uses the stock single-output schema, including draft Q4 extend.
+    if query.dtype == torch.float8_e4m3fn:
+        return torch.ops.npu.npu_quant_lightning_indexer
+    return torch_npu.npu_quant_lightning_indexer
+
+
 @lru_cache(maxsize=1)
 def _create_hadamard_128_cpu() -> torch.Tensor:
     matrix = [[1.0]]
@@ -419,6 +427,7 @@ class DSANPUIndexerMixin:
                     query_quant_mode=0,
                     key_quant_mode=0,
                 )
+                quant_li = _get_npu_quant_lightning_indexer(query)
                 if envs.SGLANG_NPU_QUANT_LI_DEBUG_DIR.get():
                     from sglang.srt.hardware_backend.npu.quant_li_debug import (
                         snapshot_draft_li,
@@ -430,8 +439,9 @@ class DSANPUIndexerMixin:
                         get_attn_backend(),
                         layer_id,
                         envs.SGLANG_NPU_QUANT_LI_DEBUG_DIR.get(),
+                        operator=quant_li,
                     )
-                topk_indices = torch_npu.npu_quant_lightning_indexer(**quant_li_args)
+                topk_indices = quant_li(**quant_li_args)
                 return topk_indices.squeeze(1)
 
             topk_indices = torch_npu.npu_lightning_indexer(

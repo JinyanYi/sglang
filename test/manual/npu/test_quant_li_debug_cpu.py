@@ -1,5 +1,6 @@
 """Check diagnostic ordering and capture safety without a device runtime."""
 
+import ast
 import importlib.util
 import json
 import sys
@@ -81,3 +82,29 @@ def test_nonzero_rank_records_metadata_without_copying_kv(diagnostic, tmp_path):
     assert events == ["synchronize"]
     assert next(tmp_path.glob("rank3-*.json"))
     assert not list(tmp_path.glob("*.pt"))
+
+
+@pytest.mark.parametrize("fp8", [True, False])
+def test_fp8_li_dispatch_survives_public_entry_replacement(fp8):
+    source = SOURCE.parents[2] / "layers/attention/dsa/dsa_npu_indexer.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    tree.body = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_get_npu_quant_lightning_indexer"
+    ]
+    stock = object()
+    custom = object()
+    namespace = {
+        "torch": SimpleNamespace(
+            float8_e4m3fn="fp8",
+            ops=SimpleNamespace(npu=SimpleNamespace(npu_quant_lightning_indexer=stock)),
+        ),
+        "torch_npu": SimpleNamespace(npu_quant_lightning_indexer=custom),
+    }
+    exec(compile(tree, str(source), "exec"), namespace)
+    operator = namespace["_get_npu_quant_lightning_indexer"](
+        SimpleNamespace(dtype="fp8" if fp8 else "int8")
+    )
+    assert operator is (stock if fp8 else custom)

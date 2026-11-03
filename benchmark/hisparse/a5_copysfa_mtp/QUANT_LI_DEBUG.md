@@ -55,8 +55,12 @@ bash benchmark/hisparse/a5_copysfa_mtp/38_replay_quant_li.sh \
   "$SGLANG_NPU_QUANT_LI_DEBUG_DIR"
 ```
 
-Each fixture runs in four fresh subprocesses: custom or torch-npu binding,
-each with eager execution or an eager warmup followed by graph capture/replay.
+Each fixture runs in six fresh subprocesses: custom, torch-npu, or explicit
+npu-dispatch binding, each with eager execution or an eager warmup followed by
+graph capture/replay. The npu-dispatch case imports custom_ops and sgl_kernel_npu
+but calls `torch.ops.npu.npu_quant_lightning_indexer` explicitly, as the FP8
+framework path now does. It checks whether the stock binding still works when
+the custom packages have been loaded into the same process.
 The torch-npu subprocess does not explicitly import `custom_ops` or
 `sgl_kernel_npu`; the report records modules and schemas to verify that boundary.
 Both subprocess kinds inherit the same OPP environment. This comparison changes
@@ -79,4 +83,21 @@ For normal serving or performance runs, remove the hook:
 
 ```bash
 unset SGLANG_NPU_QUANT_LI_DEBUG_DIR
+```
+
+## Observed binding differential
+
+The manually reported `20261103T061228Z-replay-quant-li` run uses identical
+rank0 draft-extend inputs: Q `[64,32,128]` FP8, sixteen requests with Q length 4
+and KV length 4, BF16 weights, FP32 scales. Both custom cases exit 139; both
+torch-npu cases exit 0 and return indices `[64,1,2048]` INT32. This identifies
+a binding-dependent execution failure for that fixture. It does not prove a
+specific ABI mismatch or model accuracy. The explicit npu-dispatch case and
+the updated full-model FP8 path still require manual A5 validation.
+
+To test only the new explicit dispatcher path against an existing snapshot:
+
+```bash
+LI_REPLAY_BINDINGS=npu-dispatch \
+  bash benchmark/hisparse/a5_copysfa_mtp/38_replay_quant_li.sh /tmp/<SNAPSHOT_DIRECTORY>
 ```

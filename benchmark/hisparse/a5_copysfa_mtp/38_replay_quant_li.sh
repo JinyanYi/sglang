@@ -18,10 +18,11 @@ shopt -s nullglob
 fixtures=("$snapshot_dir"/rank0-*.pt)
 (( ${#fixtures[@]} > 0 )) || { echo "No rank0 fixtures in $snapshot_dir" >&2; exit 2; }
 failed=0
+read -r -a bindings <<< "${LI_REPLAY_BINDINGS:-custom torch-npu npu-dispatch}"
 printf 'case\texit_code\n' > "$RUN_DIR/summary.tsv"
 for fixture in "${fixtures[@]}"; do
   stem="$(basename "$fixture" .pt)"
-  for binding in custom torch-npu; do
+  for binding in "${bindings[@]}"; do
     for mode in eager graph; do
       extra=()
       [[ "$mode" != graph ]] || extra+=(--graph)
