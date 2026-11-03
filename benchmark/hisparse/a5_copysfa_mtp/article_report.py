@@ -18,6 +18,7 @@ COMPONENTS = (
     "LI",
     "CopySFA",
     "SFA",
+    "attention_vector_aux",
     "kv_copy_candidates",
     "memcpy_unattributed",
     "dispatch_candidates",
@@ -26,8 +27,13 @@ COMPONENTS = (
 )
 
 
-def component(name):
+def component(name, task_type=None):
     label = category(name)
+    if label in {"CopySFA", "SFA"} and task_type is not None:
+        # A5 exports vector helpers (or the vector side of a mixed kernel)
+        # with attention-related names as well. They are not extra layers.
+        if str(task_type).upper() not in {"AI_CORE", "MIX_AIC", "AICORE"}:
+            return "attention_vector_aux"
     if label == "copy":
         return (
             "kv_copy_candidates"
@@ -66,7 +72,35 @@ def is_compute(event):
 
 def signature(event):
     args = event["args"]
-    return (str(args["Task Id"]), str(args.get("Subtask Id")), event["name"])
+    return (
+        str(args["Task Id"]),
+        str(args.get("Subtask Id")),
+        str(args.get("Task Type")),
+        event["name"],
+    )
+
+
+def event_component(event):
+    return component(event["name"], event.get("args", {}).get("Task Type", ""))
+
+
+def attention_records(rows):
+    grouped = defaultdict(list)
+    for row in rows:
+        if is_compute(row) and category(row["name"]) in {"CopySFA", "SFA"}:
+            grouped[(row["name"], row.get("args", {}).get("Task Type"))].append(row)
+    return [
+        dict(
+            name=name,
+            task_type=task,
+            count=len(items),
+            duration_sum_ms=float(
+                sum((number(item["dur"]) for item in items), number(0)) / 1000
+            ),
+            samples=[dict(tid=item["tid"], args=item["args"]) for item in items[:2]],
+        )
+        for (name, task), items in grouped.items()
+    ]
 
 
 def graph_rounds(events, steps):
@@ -125,7 +159,7 @@ def inspect_trace(path, batch, min_steps, layers, assumed_tokens, measured_token
     steps = len(markers)
     model_stats = {}
     for model, rows in models.items():
-        counts = Counter(component(row["name"]) for row in rows if is_compute(row))
+        counts = Counter(event_component(row) for row in rows if is_compute(row))
         model_stats[model] = dict(
             events=len(rows),
             counts=dict(counts),
@@ -133,6 +167,7 @@ def inspect_trace(path, batch, min_steps, layers, assumed_tokens, measured_token
                 Counter(row.get("args", {}).get("Task Type") for row in rows)
             ),
             top_names=Counter(row["name"] for row in rows).most_common(10),
+            attention_records=attention_records(rows),
         )
     result = dict(
         trace=str(path),
@@ -174,7 +209,7 @@ def inspect_trace(path, batch, min_steps, layers, assumed_tokens, measured_token
         residuals = []
         for index, rows in enumerate(rounds):
             compute = [row for row in rows if is_compute(row)]
-            counts = Counter(component(row["name"]) for row in compute)
+            counts = Counter(event_component(row) for row in compute)
             if counts["CopySFA"] + counts["SFA"] != layers:
                 raise ValueError(
                     f"round {index}: attention count != {layers}: {dict(counts)}"
@@ -189,13 +224,17 @@ def inspect_trace(path, batch, min_steps, layers, assumed_tokens, measured_token
                 )
             named = []
             for label in COMPONENTS:
-                selected = [row for row in compute if component(row["name"]) == label]
+                selected = [row for row in compute if event_component(row) == label]
                 sums[label].append(
                     float(
                         sum((number(row["dur"]) for row in selected), number(0)) / 1000
                     )
                 )
-                if label not in ("other", "memcpy_unattributed"):
+                if label not in (
+                    "other",
+                    "memcpy_unattributed",
+                    "attention_vector_aux",
+                ):
                     named.extend(
                         (number(row["ts"]), number(row["ts"]) + number(row["dur"]))
                         for row in selected
@@ -292,6 +331,10 @@ def text_report(result):
                     f"model={model} counts={stats['counts']} task_types={stats['task_types']}"
                 )
                 lines.append(f"top_names={stats['top_names']}")
+                lines.append(
+                    "attention_records="
+                    + json.dumps(stats.get("attention_records", []))
+                )
             continue
         lines.append(
             f"model={trace['target_model_id']} rounds={trace['target_step_count']} ITL_intervals={trace['itl_intervals']}"
@@ -299,6 +342,12 @@ def text_report(result):
         lines.append(
             "calls/round: "
             + json.dumps(trace["per_round_component_counts"], sort_keys=True)
+        )
+        lines.append(
+            "attention_records="
+            + json.dumps(
+                trace["models"][trace["target_model_id"]].get("attention_records", [])
+            )
         )
         lines.append(
             f"target_graph_proxy_ms={trace['target_graph_ms']:.6f} device_ITL_ms={trace['device_itl_ms']:.6f}"
@@ -342,6 +391,7 @@ def text_report(result):
             "No no-offload baseline measured by this command; no speedup claim.",
             "Model/stream task grouping is structural evidence, not pure layer-boundary instrumentation.",
             "Dispatch/combine categories are name-based candidates; kernel sums may overlap.",
+            "Attention layer counts use AI_CORE/MIX_AIC primary tasks; vector attention-related records are retained separately, not divided by two or discarded.",
             "Unattributed MEMCPY is reported separately; it is not assumed to be historical-KV H2D loading.",
             "Measured acceptance for this exact profiling window is unavailable unless explicitly supplied.",
             "Weight/activation/KV/host memory attribution is not inferred from kernel durations.",

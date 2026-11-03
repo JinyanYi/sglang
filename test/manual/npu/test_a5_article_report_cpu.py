@@ -174,6 +174,56 @@ def test_metadata_memcpy_is_not_called_kv_loading(analysis):
     assert analysis.component("unidex_copy_21") == "kv_copy_candidates"
 
 
+@pytest.mark.parametrize("kind", ["AI_VECTOR_CORE", "MIX_AIV"])
+def test_a5_attention_vector_records_do_not_double_layer_counts(
+    analysis, tmp_path, kind
+):
+    events = fixture_events()
+    helpers = []
+    for row in events:
+        if "CopySparse" in row["name"]:
+            # A5 may export the mixed vector side or an API-prefixed helper.
+            helpers.append(
+                dict(row, dur=0.1, args=dict(row["args"], **{"Task Type": kind}))
+            )
+    row = inspect(analysis, tmp_path, events + helpers)
+    assert row["status"] == "graph_proxy_validated"
+    assert row["per_round_component_counts"]["CopySFA"] == 78
+    assert row["per_round_component_counts"]["attention_vector_aux"] == 78
+    assert row["target_component_sum_ms"]["CopySFA"] == pytest.approx(0.039)
+    assert row["target_component_sum_ms"]["attention_vector_aux"] == pytest.approx(
+        0.0078
+    )
+    records = row["models"]["7"]["attention_records"]
+    assert sum(record["count"] for record in records) == 312
+
+
+def test_vector_attention_names_alone_do_not_establish_78_layers(analysis, tmp_path):
+    events = fixture_events()
+    for row in events:
+        if "CopySparse" in row["name"]:
+            row["args"]["Task Type"] = "AI_VECTOR_CORE"
+    row = inspect(analysis, tmp_path, events)
+    assert row["status"] == "incomplete"
+
+
+def test_mixed_engine_first_task_uses_typed_anchor(analysis):
+    events = []
+    for start in (0, 1000):
+        for kind in ("MIX_AIC", "MIX_AIV"):
+            events.append(
+                dict(
+                    name="Attention",
+                    tid=1,
+                    ts=str(start),
+                    dur=1,
+                    args={"Task Id": 0, "Subtask Id": 0, "Task Type": kind},
+                )
+            )
+    rounds, _ = analysis.graph_rounds(events, 2)
+    assert list(map(len, rounds)) == [2, 2]
+
+
 @pytest.mark.parametrize("stack,expected_exit", [(False, 0), (True, 2)])
 def test_cli_writes_pasteable_report_and_keeps_stack_modes_separate(
     analysis, tmp_path, monkeypatch, stack, expected_exit

@@ -32,6 +32,12 @@ The report follows the local `Offload.txt` sections 5.1.4 and 5.1.5 and Table 7:
   boundaries need separate validated instrumentation or manual attribution.
 - Sum component kernel durations only within that target graph. Include
   `AI_VECTOR_CORE`, which the older broad summary filter omitted. Duration sums
+  for attention-related vector records are separate from primary AIC attention
+  tasks: the primary `AI_CORE`/`MIX_AIC` count establishes layer count. Export
+  raw names, task types, counts and sample task IDs to audit this distinction.
+  Do not divide a doubled raw record count by two. Mixed engine types are also
+  part of the stream anchor signature.
+  Duration sums
   may overlap. Residual time subtracts the union of named article-candidate
   intervals and retains gaps. Dispatch/combine remain name-based candidates;
   generic MEMCPY is not automatically historical-KV loading.
