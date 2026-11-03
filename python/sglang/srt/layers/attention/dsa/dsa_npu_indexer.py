@@ -401,7 +401,7 @@ class DSANPUIndexerMixin:
                     pool.indexer_hadamard_128,
                     pool.dtype,
                 )
-                topk_indices = torch_npu.npu_quant_lightning_indexer(
+                quant_li_args = dict(
                     query=query,
                     key=past_key_states,
                     weights=weights,
@@ -419,6 +419,19 @@ class DSANPUIndexerMixin:
                     query_quant_mode=0,
                     key_quant_mode=0,
                 )
+                if envs.SGLANG_NPU_QUANT_LI_DEBUG_DIR.get():
+                    from sglang.srt.hardware_backend.npu.quant_li_debug import (
+                        snapshot_draft_li,
+                    )
+
+                    snapshot_draft_li(
+                        quant_li_args,
+                        forward_batch,
+                        get_attn_backend(),
+                        layer_id,
+                        envs.SGLANG_NPU_QUANT_LI_DEBUG_DIR.get(),
+                    )
+                topk_indices = torch_npu.npu_quant_lightning_indexer(**quant_li_args)
                 return topk_indices.squeeze(1)
 
             topk_indices = torch_npu.npu_lightning_indexer(

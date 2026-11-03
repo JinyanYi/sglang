@@ -230,3 +230,5 @@ needle correctness, hot cached-token evidence, completed request count,
 throughput/latency metrics, and the raw log/profile paths. Until these manual
 stages run, no A5 correctness,
 service, graph, radix, throughput or profiling success is claimed.
+
+For a native draft LI warmup segfault, see [input snapshots and isolated replay](QUANT_LI_DEBUG.md).
