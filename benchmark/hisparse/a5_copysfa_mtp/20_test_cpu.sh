@@ -16,6 +16,7 @@ run_logged kernel_cpu "$PYTHON_BIN" -m pytest -q \
 
 run_logged framework_source_cpu "$PYTHON_BIN" -m pytest -q \
   "$FRAMEWORK_ROOT/test/manual/npu/test_a5_joint_handoff_cpu.py" \
+  "$FRAMEWORK_ROOT/test/manual/npu/test_npu_draft_extend_capture_metadata.py" \
   "$FRAMEWORK_ROOT/test/manual/npu/test_a5_copy_sfa_contract.py" \
   "$FRAMEWORK_ROOT/test/manual/npu/test_sparse_kv_offload_cache.py"
 

@@ -65,6 +65,10 @@ def resolve_draft_extend_seq_len_fill_value(
     """Pad synthetic history past the fixed draft-width subtraction and KPool offset."""
     fill_value = attn_backend.get_cuda_graph_seq_len_fill_value()
     full_attn_backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+    if str(getattr(full_attn_backend, "device", "")).startswith("npu"):
+        # Draft extend supplies the complete query block. Its synthetic KV
+        # history must cover that block for the native quantized LI path.
+        fill_value = max(fill_value, captured_req_width)
     dsa_index_kpool = getattr(full_attn_backend, "dsa_index_kpool", 1)
     if dsa_index_kpool > 1:
         fill_value = max(fill_value, captured_req_width + dsa_index_kpool)
