@@ -16,6 +16,20 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
 PACKED_ROW_BYTES = 656
 
 
+def _eager_c8_request_ids(batch):
+    """Resolve optional host request IDs outside graph execution only."""
+    indices = batch.req_pool_indices_cpu
+    if indices is None:
+        indices = batch.req_pool_indices.detach().cpu()
+        # Reuse this fresh mirror across prefill layers. Speculative modes
+        # intentionally retain device-only request slots in ForwardBatch.
+        if batch.forward_mode.is_extend_without_speculative():
+            batch.req_pool_indices_cpu = indices
+    if indices.numel() != batch.req_pool_indices.numel():
+        raise ValueError("C8 eager CPU and device request counts must match")
+    return indices.tolist()
+
+
 class C8Cache:
     def __init__(self, manager, query_heads, compute_dtype):
         self.operator = load_quant_copy_sfa_operator()
@@ -127,7 +141,7 @@ def forward_c8_offload(
     if backend.graph_mode:
         raise RuntimeError("Short A5 target rows must use the eager QSFA fallback")
     manager.lim_adapter.reset_requests(batch.req_pool_indices)
-    reqs_cpu = batch.req_pool_indices_cpu.tolist()
+    reqs_cpu = _eager_c8_request_ids(batch)
     if batch.forward_mode.is_target_verify():
         lengths = (
             batch.positions[: batch.batch_size * 4].view(batch.batch_size, 4)[:, -1] + 1
@@ -137,7 +151,13 @@ def forward_c8_offload(
         lengths_cpu = kv_lengths.cpu().tolist()
     else:
         kv_lengths = batch.seq_lens
-        lengths_cpu = batch.seq_lens_cpu.tolist()
+        lengths_cpu = (
+            batch.seq_lens_cpu
+            if batch.seq_lens_cpu is not None
+            else batch.seq_lens.detach().cpu()
+        ).tolist()
+    if len(reqs_cpu) != len(lengths_cpu):
+        raise ValueError("C8 eager request and sequence-length counts must match")
     pages_cpu = []
     for request, length in zip(reqs_cpu, lengths_cpu):
         if (
