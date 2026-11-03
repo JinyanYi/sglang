@@ -119,8 +119,11 @@ bash benchmark/hisparse/a5_copysfa_mtp/45_prefix_sanity.sh
 bash benchmark/hisparse/a5_copysfa_mtp/50_perf.sh
 ```
 
-The workload sends one wave (64 requests), primes and probes the entire
-identical input on every DP, and requires every request to report the full
+The workload primes and probes the entire identical input on every DP,
+completes one full decode warmup wave (64 requests, 1,024 output tokens each),
+then measures one further wave of 64 requests without flushing the cache.
+Warmup results are separate from the measured result. Every request must report
+the full
 page-aligned cacheable prefix (39,936 of 40,000 tokens with page size 128).
 It preserves native `sglang.benchmark.serving` output throughput and TPOT
 in `bench-serving.jsonl` and `benchmark.log`, with a separate

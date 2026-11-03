@@ -51,7 +51,17 @@ This sends exactly one measured wave: 28 requests at native per-DP BS7,
 or 64 at offload per-DP BS16. Each request has 40,000 input tokens and 1,024
 output tokens. `NUM_PROMPTS` is fixed to global concurrency; no refill occurs.
 The complete identical input is primed and probed separately on each DP before
-measurement, then every measured request is routed to a primed DP.
+decode warmup, then every request is routed to a primed DP.
+
+Before measurement, the script runs one complete decode warmup wave with the
+same token IDs, DP routing, concurrency and 1,024 output tokens per request.
+This is 28 warmup requests followed by 28 measured requests for native BS7,
+or 64 followed by 64 for offload BS16. Each phase is a single wave without
+refill. All warmup responses must finish and pass the same cache gate before
+measurement starts. `DECODE_WARMUP_ROUNDS` defaults to one and must be positive.
+There is no cache flush or re-priming between decode warmup and measurement.
+Radix and offload cache state may stay warm; this is a warmed serving test,
+not a controlled cold-C-pool experiment or a prescribed 95/91 C-hit test.
 
 With page size 128, SGLang's last-token recomputation and page alignment limit
 the reusable input to 39,936 tokens. Every request must report exactly that
@@ -63,11 +73,19 @@ not the offload C-pool's TopK hit rate.
 Preserve `bench-serving.jsonl` (unaltered native results and request details),
 `benchmark.log` (original benchmark table), `cache-validation.json`,
 `workload.json` (priming, probes and routing), `input_ids.json` and server logs.
+`decode-warmup-1.jsonl` stores the native warmup results separately, with its
+own `.validation.json` and `.argv.json`. Additional warmup rounds have numbered
+files. Only the final `NATIVE_BENCH_SERVING_RESULT` and `bench-serving.jsonl`
+are the measured result; the console also prints explicitly labeled warmup
+tables and `NATIVE_DECODE_WARMUP_RESULT` lines. Warmup time/tokens are excluded
+from measured duration, request count, throughput and TPOT.
 The benchmark prints output throughput, mean/median TPOT and TTFT. Whole-wave
 throughput includes TTFT and final draining; TPOT excludes first-token wait.
 No custom steady-window TPS or assumed MTP acceptance replaces these metrics.
 Require exit zero, `valid: true`, and all 28/64 requests completed. Both modes
 must be rerun with this protocol; the earlier 256-request run is different.
+The previous one-wave runs that only primed with one output token also lack
+this full decode warmup and should be retained as separate results.
 
 Also run a **same-concurrency comparison** at per-DP BS16 (global 64), if the
 native service can support it: stop the BS7 instance, set

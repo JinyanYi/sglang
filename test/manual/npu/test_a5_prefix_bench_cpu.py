@@ -22,18 +22,21 @@ def load(monkeypatch):
 
 
 @pytest.mark.parametrize("count", [28, 64])
+@pytest.mark.parametrize("rounds,bad_warmup", [(1, False), (2, False), (1, True)])
 def test_one_wave_native_metrics_and_full_cache_gate(
-    tmp_path, monkeypatch, capsys, count
+    tmp_path, monkeypatch, capsys, count, rounds, bad_warmup
 ):
     bench = load(monkeypatch)
     probes = []
+    flushes = []
+    waves = []
     tokenizer = SimpleNamespace(encode=lambda *a, **kw: [11, 17, 23])
     transformers = ModuleType("transformers")
     transformers.AutoTokenizer = SimpleNamespace(
         from_pretrained=lambda *a, **kw: tokenizer
     )
     monkeypatch.setitem(sys.modules, "transformers", transformers)
-    monkeypatch.setattr(bench, "post", lambda *a: None)
+    monkeypatch.setattr(bench, "post", lambda *a: flushes.append(a))
 
     def probe(url, ids, output, timeout, index, lock, active, target, rank):
         probes.append((rank, list(ids)))
@@ -75,7 +78,15 @@ def test_one_wave_native_metrics_and_full_cache_gate(
         assert [row.extra_request_body["routed_dp_rank"] for row in rows] == [
             i % 4 for i in range(count)
         ]
-        output.write_text(json.dumps(result) + "\n")
+        wave_output = Path(argv[argv.index("--output-file") + 1])
+        is_warmup = wave_output.name.startswith("decode-warmup-")
+        wave_result = dict(result)
+        if is_warmup:
+            wave_result["output_throughput"] = 1.0
+            if bad_warmup:
+                wave_result["cached_tokens"] = [39808] + [39936] * (count - 1)
+        waves.append(wave_output)
+        wave_output.write_text(json.dumps(wave_result) + "\n")
 
     serving.cli_main = cli
     package = ModuleType("sglang.benchmark")
@@ -91,16 +102,67 @@ def test_one_wave_native_metrics_and_full_cache_gate(
             "model",
             "--concurrency",
             str(count),
+            "--decode-warmup-rounds",
+            str(rounds),
             "--output",
             str(output),
         ],
     )
+    if bad_warmup:
+        with pytest.raises(RuntimeError, match="decode_warmup_1 failed validation"):
+            bench.main()
+        assert len(waves) == 1
+        assert not output.exists()
+        assert not json.loads(
+            (tmp_path / "decode-warmup-1.validation.json").read_text()
+        )["valid"]
+        assert serving.get_dataset is original_dataset
+        return
     assert bench.main() == 0
+    assert len(waves) == rounds + 1
+    assert waves[-1] == output
+    assert len(flushes) == 1
+    assert flushes[0][0].endswith("/flush_cache")
     assert [rank for rank, ids in probes] == list(range(4)) * 2
     assert serving.get_dataset is original_dataset
     assert json.loads(output.read_text()) == result
     assert json.loads((tmp_path / "cache-validation.json").read_text())["valid"]
-    assert '"output_throughput": 123.456' in capsys.readouterr().out
+    manifest = json.loads((tmp_path / "workload.json").read_text())
+    assert len(manifest["decode_warmup_results"]) == rounds
+    assert manifest["measurement"]["output_throughput"] == 123.456
+    assert all(
+        row["output_throughput"] == 1 for row in manifest["decode_warmup_results"]
+    )
+    assert not manifest["flush_between_decode_warmup_and_measurement"]
+    console = capsys.readouterr().out
+    measured_line = next(
+        line
+        for line in console.splitlines()
+        if line.startswith("NATIVE_BENCH_SERVING_RESULT")
+    )
+    assert '"output_throughput": 123.456' in measured_line
+
+
+def test_decode_warmup_cannot_be_disabled(tmp_path, monkeypatch):
+    bench = load(monkeypatch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "bench",
+            "--model-path",
+            "model",
+            "--concurrency",
+            "28",
+            "--decode-warmup-rounds",
+            "0",
+            "--output",
+            str(tmp_path / "result.jsonl"),
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        bench.main()
+    assert exc.value.code == 2
 
 
 @pytest.mark.parametrize(

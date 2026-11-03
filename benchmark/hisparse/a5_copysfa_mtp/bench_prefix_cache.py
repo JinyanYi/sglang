@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prime every DP, then supply one fixed token-ID wave to native bench_serving."""
+"""Prime every DP, warm full decode, then measure one native serving wave."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def validate_result(result, count, input_tokens, output_tokens, expected_cached)
     return errors
 
 
-def run_native_benchmark(args, token_ids):
+def run_native_benchmark(args, token_ids, output):
     """Adapt only dataset/routing; preserve native timing, SSE parsing and metrics."""
     from sglang.benchmark import serving
 
@@ -55,7 +55,9 @@ def run_native_benchmark(args, token_ids):
         ]
 
     # cli_main supplies the installed benchmark's complete argument defaults.
-    # No warmup or flush is allowed between explicit priming and measurement.
+    # Each call is one complete wave. The benchmark's short default warmup
+    # stays disabled; full decode warmup is an explicit, separately saved call.
+    # No cache flush is allowed between priming, decode warmup and measurement.
     argv = [
         "sglang.benchmark.serving",
         "--backend",
@@ -86,11 +88,9 @@ def run_native_benchmark(args, token_ids):
         "--cache-report",
         "--output-details",
         "--output-file",
-        str(args.output),
+        str(output),
     ]
-    args.output.with_name("bench-serving.argv.json").write_text(
-        json.dumps(argv, indent=2) + "\n"
-    )
+    output.with_suffix(".argv.json").write_text(json.dumps(argv, indent=2) + "\n")
     try:
         serving.get_dataset = dataset
         sys.argv = argv
@@ -102,12 +102,59 @@ def run_native_benchmark(args, token_ids):
             os.environ["SGLANG_IS_IN_CI"] = original_ci
 
 
+def checked_wave(args, token_ids, expected_cached, output, phase):
+    """Keep native results intact and validate every warmup/measured request."""
+    print(
+        f"WAVE_START phase={phase} requests={args.concurrency} "
+        f"output_tokens={args.output_tokens} result={output}",
+        flush=True,
+    )
+    run_native_benchmark(args, token_ids, output)
+    result = json.loads(output.read_text().strip().splitlines()[-1])
+    errors = validate_result(
+        result, args.concurrency, args.input_tokens, args.output_tokens, expected_cached
+    )
+    validation = dict(valid=not errors, phase=phase, errors=errors)
+    validation_path = (
+        output.parent / "cache-validation.json"
+        if phase == "measurement"
+        else output.with_suffix(".validation.json")
+    )
+    validation_path.write_text(json.dumps(validation, indent=2) + "\n")
+    # Copy values from native bench_serving without recomputing any metric.
+    summary = {
+        key: result.get(key)
+        for key in (
+            "completed",
+            "duration",
+            "output_throughput",
+            "mean_tpot_ms",
+            "median_tpot_ms",
+            "mean_ttft_ms",
+            "accept_length",
+        )
+    }
+    label = (
+        "NATIVE_BENCH_SERVING_RESULT"
+        if phase == "measurement"
+        else "NATIVE_DECODE_WARMUP_RESULT"
+    )
+    print(label + " " + json.dumps(summary), flush=True)
+    print("CACHE_VALIDATION " + json.dumps(validation), flush=True)
+    if errors:
+        raise RuntimeError(f"{phase} failed validation: {validation_path}")
+    return dict(
+        phase=phase, result=str(output), validation=str(validation_path), **summary
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:30000")
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--input-tokens", type=int, default=40000)
     parser.add_argument("--output-tokens", type=int, default=1024)
+    parser.add_argument("--decode-warmup-rounds", type=int, default=1)
     parser.add_argument("--concurrency", type=int, required=True)
     parser.add_argument("--dp-size", type=int, default=4)
     parser.add_argument("--page-size", type=int, default=128)
@@ -120,9 +167,16 @@ def main():
         args.page_size < 1
         or args.input_tokens <= args.page_size
         or args.output_tokens < 2
+        or args.decode_warmup_rounds < 1
     ):
-        parser.error("require input > page-size > 0 and output >= 2")
-    if args.output.exists():
+        parser.error(
+            "require input > page-size > 0, output >= 2 and decode warmup rounds >= 1"
+        )
+    warmup_outputs = [
+        args.output.with_name(f"decode-warmup-{index + 1}.jsonl")
+        for index in range(args.decode_warmup_rounds)
+    ]
+    if any(path.exists() for path in [args.output, *warmup_outputs]):
         parser.error("output already exists; use a fresh RUN_DIR")
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -149,7 +203,7 @@ def main():
     prime = [probe(rank) for rank in range(args.dp_size)]
     probes = [probe(rank) for rank in range(args.dp_size)]
     manifest = dict(
-        protocol="one measured wave; native bench_serving metrics; no profiler",
+        protocol="full decode warmup followed by one measured wave; native metrics; no profiler",
         num_prompts=args.concurrency,
         concurrency=args.concurrency,
         attention_dp_size=args.dp_size,
@@ -163,51 +217,35 @@ def main():
         prime=prime,
         probes=probes,
         routing=[index % args.dp_size for index in range(args.concurrency)],
+        decode_warmup_rounds=args.decode_warmup_rounds,
+        decode_warmup_output_tokens_per_request=args.output_tokens,
+        decode_warmup_results=[],
+        flush_between_decode_warmup_and_measurement=False,
         timing_scope="Native whole-wave serving duration, including TTFT and drain",
         cache_scope="Every request must hit all page-aligned cacheable input tokens",
     )
-    (args.output.parent / "workload.json").write_text(
-        json.dumps(manifest, indent=2) + "\n"
-    )
+    manifest_path = args.output.parent / "workload.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     if any(row["cached_tokens"] != expected_cached for row in probes):
         raise RuntimeError(
             "DP cache probe failed; inspect workload.json before retrying"
         )
+    for index, output in enumerate(warmup_outputs, 1):
+        summary = checked_wave(
+            args, token_ids, expected_cached, output, f"decode_warmup_{index}"
+        )
+        manifest["decode_warmup_results"].append(summary)
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     print(
-        f"SINGLE_WAVE requests={args.concurrency} per_dp={args.concurrency // args.dp_size} "
-        f"expected_cached={expected_cached}/{args.input_tokens} profiler=False",
+        f"DECODE_WARMUP_COMPLETE waves={args.decode_warmup_rounds}; "
+        "starting one measured wave without flushing cache",
         flush=True,
     )
-    run_native_benchmark(args, token_ids)
-    result = json.loads(args.output.read_text().strip().splitlines()[-1])
-    errors = validate_result(
-        result, args.concurrency, args.input_tokens, args.output_tokens, expected_cached
+    manifest["measurement"] = checked_wave(
+        args, token_ids, expected_cached, args.output, "measurement"
     )
-    validation = dict(valid=not errors, errors=errors)
-    (args.output.parent / "cache-validation.json").write_text(
-        json.dumps(validation, indent=2) + "\n"
-    )
-    # Values below are copied from native bench_serving without recomputation.
-    print(
-        "NATIVE_BENCH_SERVING_RESULT "
-        + json.dumps(
-            {
-                key: result.get(key)
-                for key in (
-                    "completed",
-                    "duration",
-                    "output_throughput",
-                    "mean_tpot_ms",
-                    "median_tpot_ms",
-                    "mean_ttft_ms",
-                    "accept_length",
-                )
-            }
-        ),
-        flush=True,
-    )
-    print("CACHE_VALIDATION " + json.dumps(validation), flush=True)
-    return 0 if not errors else 1
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    return 0
 
 
 if __name__ == "__main__":

@@ -200,8 +200,12 @@ MODEL_PATH="$MODEL_PATH" CONCURRENCY=16 \
 
 `50_perf.sh` sends one wave with total requests equal to global concurrency.
 It primes and probes the complete identical token-ID input on every DP,
-then uses native `sglang.benchmark.serving` timing, throughput and TPOT.
-Every measured request must reuse the entire page-aligned cacheable prefix
+then completes a separate full decode warmup wave with the same input,
+concurrency and output length. Without flushing the cache, it measures one
+more wave using native `sglang.benchmark.serving` timing, throughput and TPOT.
+Warmup metrics are stored separately in `decode-warmup-1.jsonl` and excluded
+from the final result. Every warmup and measured request must reuse the entire
+page-aligned cacheable prefix
 (39,936 of 40,000 input tokens for page size 128), complete its requested
 output, and pass `cache-validation.json`. No profiler runs. Raw results are
 saved in `bench-serving.jsonl`; see [protocol and commands](NO_OFFLOAD.md).
