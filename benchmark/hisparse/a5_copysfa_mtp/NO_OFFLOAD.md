@@ -1,8 +1,9 @@
 # Same-version SGLang native A5 baseline
 
-The primary result is measured client output tokens divided by elapsed time
-from `50_perf.sh`. Profiling and the article's assumed-acceptance formulas are
-secondary diagnostics and must not replace measured serving throughput.
+The primary results are native `sglang.benchmark.serving` output throughput
+and TPOT from `50_perf.sh`. The adapter supplies token IDs and DP routing;
+native streaming, timing and metric formulas are unchanged. Profiling and the
+article's assumed-acceptance formulas are secondary diagnostics.
 
 This launcher uses the same framework, installed kernel wheel, GLM-5.2
 W4A4C8/MXFP4 model, FP8 KV, DP4/attention-TP2/EP8, MTP3, radix cache, DeepEP
@@ -46,11 +47,27 @@ RUN_DIR="$RUN_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-native-b7-serving-perf" \
   bash benchmark/hisparse/a5_copysfa_mtp/50_perf.sh
 ```
 
-This uses the same 256 requests, 40,000 input tokens, 1,024 output tokens and
-shared-prefix generation/radix priming as the earlier offload run. The JSON
-records completed count, output-token count, elapsed seconds, actual output
-tokens/s, TTFT and TPOT. Preserve the command, server log and JSON. A failed
-request or unexpected scheduler admission limit is not a valid performance run.
+This sends exactly one measured wave: 28 requests at native per-DP BS7,
+or 64 at offload per-DP BS16. Each request has 40,000 input tokens and 1,024
+output tokens. `NUM_PROMPTS` is fixed to global concurrency; no refill occurs.
+The complete identical input is primed and probed separately on each DP before
+measurement, then every measured request is routed to a primed DP.
+
+With page size 128, SGLang's last-token recomputation and page alignment limit
+the reusable input to 39,936 tokens. Every request must report exactly that
+number; otherwise the run exits nonzero. This is full cacheable-prefix reuse
+on every request, not a claim that all 40,000 input tokens avoid recomputation.
+The remaining 64 tokens still require processing. These are radix prefix hits,
+not the offload C-pool's TopK hit rate.
+
+Preserve `bench-serving.jsonl` (unaltered native results and request details),
+`benchmark.log` (original benchmark table), `cache-validation.json`,
+`workload.json` (priming, probes and routing), `input_ids.json` and server logs.
+The benchmark prints output throughput, mean/median TPOT and TTFT. Whole-wave
+throughput includes TTFT and final draining; TPOT excludes first-token wait.
+No custom steady-window TPS or assumed MTP acceptance replaces these metrics.
+Require exit zero, `valid: true`, and all 28/64 requests completed. Both modes
+must be rerun with this protocol; the earlier 256-request run is different.
 
 Also run a **same-concurrency comparison** at per-DP BS16 (global 64), if the
 native service can support it: stop the BS7 instance, set
@@ -61,8 +78,8 @@ If it fails, retain the actual failure and memory evidence rather than silently
 reducing concurrency. The allocator's token capacity must be inspected before
 calling any setting the maximum for independent 40K contexts.
 
-The earlier offload experiment and this directly comparable client test share
-39,872 input-prefix tokens. Independent-context capacity is a separate workload;
+The earlier offload experiment shared 39,872 input-prefix tokens; this new
+protocol primes the entire identical input. Independent-context capacity is a separate workload;
 these results do not prove the article's independent `BS*S` KV residency.
 For a controlled optional KV cap use `BASELINE_MAX_TOTAL_TOKENS`; otherwise the
 launcher clears an inherited `MAX_TOTAL_TOKENS` and lets the allocator budget it.

@@ -119,12 +119,14 @@ bash benchmark/hisparse/a5_copysfa_mtp/45_prefix_sanity.sh
 bash benchmark/hisparse/a5_copysfa_mtp/50_perf.sh
 ```
 
-The workload verifies exact output lengths, saves every request's TTFT/TPOT,
-requires radix hits, and records live client concurrency. Radix cached_tokens
-is not C-pool hit rate. It saves metrics before/after the measured interval,
-including acceptance gauges where exposed. They are per-log-interval gauges,
-not cumulative acceptance counters. Use acceptance measured for the profiled
-window when deriving article throughput. Controlled95/91 C-hit tests remain
+The workload sends one wave (64 requests), primes and probes the entire
+identical input on every DP, and requires every request to report the full
+page-aligned cacheable prefix (39,936 of 40,000 tokens with page size 128).
+It preserves native `sglang.benchmark.serving` output throughput and TPOT
+in `bench-serving.jsonl` and `benchmark.log`, with a separate
+`cache-validation.json` pass/fail gate. See [measurement protocol](NO_OFFLOAD.md).
+Radix cached_tokens is not C-pool hit rate. Use acceptance measured for the
+profiled window when deriving article throughput. Controlled95/91 C-hit tests remain
 standalone tests, not claims about the model's actual hit distribution.
 The runtime check requires all four DP scheduler states, the effective BS16
 limit, FP8 KV, radix, MTP3 and graph configuration. Silent capacity reductions

@@ -193,15 +193,18 @@ frozen IDs, raw responses, server log and all exit codes.
 Run unprofiled serving performance separately from profiling:
 
 ```bash
-MODEL_PATH="$MODEL_PATH" NUM_PROMPTS=72 CONCURRENCY=16 \
+MODEL_PATH="$MODEL_PATH" CONCURRENCY=16 \
   INPUT_TOKENS=65536 OUTPUT_TOKENS=1024 \
   bash ./benchmark/hisparse/a5_copysfa_mtp/50_perf.sh
 ```
 
-`50_perf.sh` sends exact token IDs with a 65,408-token shared prefix, validates
-all 1,024-token streaming outputs and reported radix hits, and records
-request-level TTFT/TPOT plus the full completion count. It runs with no
-profiler.
+`50_perf.sh` sends one wave with total requests equal to global concurrency.
+It primes and probes the complete identical token-ID input on every DP,
+then uses native `sglang.benchmark.serving` timing, throughput and TPOT.
+Every measured request must reuse the entire page-aligned cacheable prefix
+(39,936 of 40,000 input tokens for page size 128), complete its requested
+output, and pass `cache-validation.json`. No profiler runs. Raw results are
+saved in `bench-serving.jsonl`; see [protocol and commands](NO_OFFLOAD.md).
 
 For a decode-only profile, use two terminals. Start the workload first:
 
