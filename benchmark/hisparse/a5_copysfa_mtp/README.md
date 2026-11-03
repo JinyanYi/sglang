@@ -232,3 +232,7 @@ stages run, no A5 correctness,
 service, graph, radix, throughput or profiling success is claimed.
 
 For a native draft LI warmup segfault, see [input snapshots and isolated replay](QUANT_LI_DEBUG.md).
+
+To analyze a completed capture locally and paste a compact text report, use
+[`66_article_report.sh CASE_ROOT`](ARTICLE_REPORT.md). It separates target and
+draft graphs and labels the article's three-token assumption and graph proxies.
