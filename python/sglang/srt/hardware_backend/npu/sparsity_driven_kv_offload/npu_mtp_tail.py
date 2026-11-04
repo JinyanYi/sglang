@@ -22,6 +22,7 @@ def _tail_metadata_kernel(
     REQUEST_STRIDE: tl.constexpr,
     C: tl.constexpr,
     Q: tl.constexpr,
+    Q_BLOCK: tl.constexpr,
 ):
     batch = tl.program_id(0)
     request = tl.load(requests + batch).to(tl.int32)
@@ -42,11 +43,11 @@ def _tail_metadata_kernel(
     tl.store(history_src + batch * 128 + offset, physical)
     tl.store(history_dst + batch * 128 + offset, tl.where(restore, dst, 0))
     tl.store(history_valid + batch * 128 + offset, restore)
-    q = tl.arange(0, Q)
+    q = tl.arange(0, Q_BLOCK)
     qpos = first + q
     qdst = safe.to(tl.int64) * (C + 256) + C + qpos % 256
-    tl.store(current_dst + batch * Q + q, tl.where(active, qdst, 0))
-    tl.store(current_valid + batch * Q + q, active)
+    tl.store(current_dst + batch * Q + q, tl.where(active, qdst, 0), mask=q < Q)
+    tl.store(current_valid + batch * Q + q, active, mask=q < Q)
     # The following data copies and consumers all use this ordered stream.
     tl.store(starts + safe, prefix, mask=active)
     tl.store(ends + safe, last, mask=active)
@@ -70,8 +71,8 @@ def stage_mtp_tail(
 ):
     """Write current candidates locally; restore only missing stable tail rows."""
     batch = requests.numel()
-    if query_width not in (1, 4):
-        raise ValueError("Tail query width must be 1 or 4")
+    if not 1 <= query_width <= 14:
+        raise ValueError("Tail query width must be in [1,14]")
     if (
         positions.numel() < batch * query_width
         or current.shape[0] < batch * query_width
@@ -80,6 +81,10 @@ def stage_mtp_tail(
             "Separate tail requires query_width current KV rows per request"
         )
     hs, hd, hv, cs, cd, cv = workspace
+    if any(tensor.numel() < batch * 128 for tensor in (hs, hd, hv)) or any(
+        tensor.numel() < batch * query_width for tensor in (cs, cd, cv)
+    ):
+        raise ValueError("Tail metadata workspace is smaller than the query batch")
     _tail_metadata_kernel[(batch,)](
         req_to_token,
         requests,
@@ -96,6 +101,7 @@ def stage_mtp_tail(
         req_to_token.stride(0),
         capacity,
         query_width,
+        triton.next_power_of_2(query_width),
     )
     unidex_copy_inplace(
         host,

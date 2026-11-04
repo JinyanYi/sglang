@@ -6,6 +6,62 @@ stderr and a numeric exit code beneath a new timestamped run directory.
 
 ## Source pair and ownership boundary
 
+The long-chain dynamic-query development pair is
+`feat/a5-long-general-q-mtp-20261104` in both personal forks, based on the
+validated Q4 framework `a01b4dfc1b` and kernel `138319b`. This port reuses the
+dynamic-query contract from framework PR47383 `e033255cac` and kernel PR909
+`5ebf26c`, while retaining the A5 packed-C8 quantized LIM, native CopySFA and
+prefix-relative 256-token tail. No native operator payload or tiling ABI is
+changed; the already validated A5 wheel can be reused. New native tests still
+require manual A5 execution before this branch is accepted.
+
+Local validation on 2026-11-04: 92 framework CPU tests and 23 kernel CPU tests
+passed, including geometry/budget/launch contracts and imported-payload hashes.
+Python syntax, repository-selected lint/format, changed-shell syntax and
+`git diff --check` passed. The four framework device modules require
+`torch_npu` and were not executable locally; no new A5 numerical, graph or
+performance result is claimed.
+
+Only long target chains are extended. Short/mixed requests retain the existing
+eager fallback and graph eligibility checks. A3 full-visible resident staging
+and short/mixed graph dispatch are deliberately outside this port.
+
+Decode has Q1. Chain MTP supports configured Q2..Q14 with `MTP_TOPK=1`,
+`MTP_DRAFT_TOKENS=Q` and `MTP_STEPS=Q-1`. The original quantized LIM limits the
+combined path to Q14 even though CopySFA alone accepts Q16. Long-request cache
+capacity must be 128-aligned, at least `Q*2048`, and at most 32384: C12288
+covers Q<=6; Q8 needs C>=16384; Q14 needs C>=28672. DeepEP dispatch capacity
+must cover `GRAPH_BATCH_SIZE*Q`. Choose each configuration before restarting
+and capturing its graphs; this does not add runtime adaptive-Q graph switching.
+
+`30_test_a5.sh model` now requires Q1/2/3/4/5/6/8/14 eager/graph LIM-to-CopySFA
+cases, unchanged numerical thresholds, opaque tail-byte checks and graph
+transport with acceptance, rollback, shared radix prefix and request reuse.
+To test the source-only changes with an already installed matching A5 wheel:
+
+```bash
+cd "$FRAMEWORK_ROOT"
+ASCEND_RT_VISIBLE_DEVICES=0 bash benchmark/hisparse/a5_copysfa_mtp/30_test_a5.sh model
+```
+
+For example, set these after sourcing `article_single_node.env.example` to
+launch a Q3 chain with six live requests per DP and a six-request graph bucket:
+
+```bash
+export MTP=1 GRAPH=1 MTP_STEPS=2 MTP_DRAFT_TOKENS=3 MTP_TOPK=1
+export PER_DP_BATCH_SIZE=6 GRAPH_BATCH_SIZE=6
+export MAX_RUNNING_REQUESTS=24 CONCURRENCY=24 NUM_PROMPTS=24
+export SPARSE_CACHE_SIZE=12288 MEM_FRACTION_STATIC=0.80
+bash benchmark/hisparse/a5_copysfa_mtp/40_launch_server.sh
+```
+
+Repeat the same environment in the client terminal and run `50_perf.sh` only
+after correctness gates and model startup pass. It retains full decode warmup,
+one measured wave, cache validation and native bench_serving throughput/TPOT.
+Original Q4 remains the default when `MTP_STEPS`/`MTP_DRAFT_TOKENS` are unset.
+
+The following describes the original Q4 source pair and its retained history.
+
 Use these two personal-fork checkouts together:
 
 - framework: `feat/a5-copysfa-mtp-radix-20261031`, based on

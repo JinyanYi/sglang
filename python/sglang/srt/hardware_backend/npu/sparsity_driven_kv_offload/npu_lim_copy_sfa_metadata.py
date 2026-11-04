@@ -179,7 +179,10 @@ def fused_lim_copy_sfa_metadata(
     request rows are reset to -1 across all their query rows.
     The miss source/slot buffers and all KV payloads are deliberately untouched.
     """
-    if query_width not in (1, 4):
+    if packed_c8:
+        if not 1 <= query_width <= 14:
+            raise ValueError("A5 query_width must be in [1,14].")
+    elif query_width not in (1, 4):
         raise ValueError("query_width must be 1 or 4.")
     if not isinstance(capacity, int) or not 2048 <= capacity <= 32640:
         raise ValueError("capacity must be an integer in [2048, 32640].")

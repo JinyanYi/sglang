@@ -38,5 +38,6 @@ for path in "${framework_tests[@]}"; do require_file "$path"; done
 run_logged framework_a5 "$PYTHON_BIN" -m pytest -q --junitxml="$RUN_DIR/framework-a5.xml" "${framework_tests[@]}"
 if [[ "$MODE" == model ]]; then
   run_logged joint_gate "$PYTHON_BIN" "$HANDOFF_DIR/verify_joint_junit.py" \
-    "$RUN_DIR/kernel-a5.xml" "$RUN_DIR/framework-a5.xml" --output "$RUN_DIR/joint-gate.json"
+    "$RUN_DIR/kernel-a5.xml" "$RUN_DIR/framework-a5.xml" --output "$RUN_DIR/joint-gate.json" \
+    --query-widths 1 2 3 4 5 6 8 14
 fi

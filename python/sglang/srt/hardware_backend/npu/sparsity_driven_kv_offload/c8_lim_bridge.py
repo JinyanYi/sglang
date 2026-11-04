@@ -23,6 +23,9 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_copy_sfa
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_input_metadata import (
     fused_prepare_lim_metadata,
 )
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.query_geometry import (
+    sparse_query_width,
+)
 
 
 class C8LIMBridge:
@@ -37,6 +40,7 @@ class C8LIMBridge:
         self.capacity = manager.cache_capacity
         self.rows = manager.size
         self.batch_capacity = manager.batch_capacity
+        self.max_query_width = manager.max_query_width
         self.source_capacity = manager.max_context_len
         self.mtp_full_visible = True
         self.fused_pre_metadata = envs.SGLANG_NPU_FUSED_LIM_PRE_METADATA.get()
@@ -51,11 +55,13 @@ class C8LIMBridge:
             device=device,
         )
         self.sources = torch.empty(
-            (self.batch_capacity * 4, 1, 2048), dtype=torch.int32, device=device
+            (self.batch_capacity * self.max_query_width, 1, 2048),
+            dtype=torch.int32,
+            device=device,
         )
         self.slots = torch.empty_like(self.sources)
         self.topk_misses = torch.empty(
-            self.batch_capacity * 4, dtype=torch.int32, device=device
+            self.batch_capacity * self.max_query_width, dtype=torch.int32, device=device
         )
         self.miss_sources = torch.empty(
             (self.batch_capacity, 32768), dtype=torch.int32, device=device
@@ -68,7 +74,7 @@ class C8LIMBridge:
             q: torch.arange(
                 q, q * (self.batch_capacity + 1), q, dtype=torch.int32, device=device
             )
-            for q in (1, 4)
+            for q in range(1, self.max_query_width + 1)
         }
         self.pre = {
             name: torch.empty(self.batch_capacity, dtype=dtype, device=device)
@@ -140,7 +146,7 @@ class C8LIMBridge:
             layer_id=layer_id,
             query_scale=query_scale,
             key_scale=key_scale,
-            width=4,
+            width=sparse_query_width(forward_batch),
         )
 
     def _select(
@@ -161,9 +167,13 @@ class C8LIMBridge:
             raise ValueError("A5 LIM needs the actual FP32 query and key scales")
         batch = forward_batch.batch_size
         rows = batch * width
-        if batch > self.batch_capacity or query.shape[0] < rows:
+        if (
+            not 1 <= width <= self.max_query_width
+            or batch > self.batch_capacity
+            or query.shape[0] < rows
+        ):
             raise ValueError("A5 LIM input exceeds its preallocated graph capacity")
-        if width == 4:
+        if forward_batch.forward_mode.is_target_verify():
             _, positions, live = prepare_mtp_rows(
                 forward_batch,
                 query.shape[0],

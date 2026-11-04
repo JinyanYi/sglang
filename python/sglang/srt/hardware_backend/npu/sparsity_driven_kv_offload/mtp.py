@@ -15,11 +15,19 @@ def is_sparse_mtp_batch(forward_batch) -> bool:
 
 
 def use_native_mtp_verify(backend, forward_batch, manager):
-    """Select the opt-in long Q4 verify path; short rows use the reference."""
+    """Select long verification; keep short/mixed rows outside CopySFA graphs."""
+    width = getattr(forward_batch.spec_info, "num_tokens_per_req", -1)
+    supported = (
+        isinstance(width, int)
+        and not isinstance(width, bool)
+        and 1 <= width <= manager.max_query_width
+        if getattr(manager, "packed_c8", False)
+        else width == 4
+    )
     if not (
         getattr(manager.lim_adapter, "mtp_full_visible", False)
         and forward_batch.forward_mode.is_target_verify()
-        and getattr(forward_batch.spec_info, "num_tokens_per_req", -1) == 4
+        and supported
     ):
         return False
     if backend.graph_mode:

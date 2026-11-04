@@ -51,6 +51,7 @@ def resolve_sparse_kv_budget(
     graph_batch_capacity: int = 0,
     device_tail_tokens: int = 0,
     packed_c8: bool = False,
+    max_query_width: int = 4,
 ) -> SparseKVBudget:
     """Size persistent manager allocations, including padding and one workspace.
 
@@ -85,6 +86,12 @@ def resolve_sparse_kv_budget(
             "A separate HBM tail requires native LIM/CopySFA and256 slots."
         )
     if packed_c8:
+        if (
+            isinstance(max_query_width, bool)
+            or not isinstance(max_query_width, int)
+            or not 1 <= max_query_width <= 14
+        ):
+            raise ValueError("A5 LIM query width must be in [1,14].")
         if not copy_sfa or indexer_impl != "lim" or kv_bytes_per_token != 656:
             raise ValueError("A5 C8 requires native LIM/CopySFA and 656-byte KV")
         if device_tail_tokens != 256 or context_len > 262144:
@@ -95,6 +102,7 @@ def resolve_sparse_kv_budget(
             raise ValueError("A5 C8 query heads must be 8,16,32,64,128")
         if cache_tokens > 32384:
             raise ValueError("A5 C8 capacity must be <=32384 with its tail reserve")
+    query_width = max_query_width if packed_c8 else 4
     if copy_sfa:
         if top_k != 2048 or (
             cache_tokens != 0
@@ -111,7 +119,9 @@ def resolve_sparse_kv_budget(
         cache_tokens = cache_tokens or top_k
     if mtp_full_visible and (not copy_sfa or indexer_impl != "lim"):
         raise ValueError("Experimental MTP requires native LIM and Copy-SFA.")
-    if mtp_full_visible and cache_tokens < 4 * top_k:
+    if packed_c8 and cache_tokens < query_width * top_k:
+        raise ValueError("A5 long-request LIM requires C >= query width * TopK.")
+    if mtp_full_visible and not packed_c8 and cache_tokens < 4 * top_k:
         raise ValueError("Experimental Q4 MTP requires capacity >= 4 * TopK.")
     experimental = indexer_impl != "legacy"
     native = indexer_impl == "lim"
@@ -148,12 +158,12 @@ def resolve_sparse_kv_budget(
             adapter_bytes += batch_rows * (6 * 4 + 2)
     mtp_output_bytes = 0
     if mtp_full_visible:
-        # Q4 source/slot rows, route counts, query scales and Q endpoints.
-        adapter_bytes += batch_rows * 4 * (2 * top_k * 4 + 4 + 64 * 4)
-        adapter_bytes += batch_rows * 4
+        # Source/slot rows, route counts, query scales and Q endpoints.
+        adapter_bytes += batch_rows * query_width * (2 * top_k * 4 + 4 + 64 * 4)
+        adapter_bytes += batch_rows * query_width
         mtp_output_bytes = (
             batch_rows
-            * 4
+            * query_width
             * copy_sfa_query_heads
             * 512
             * (2 if packed_c8 else kv_bytes_per_token // 576)
@@ -216,10 +226,10 @@ def resolve_sparse_kv_budget(
             * (2 if packed_c8 else kv_bytes_per_token // 576)
         )
     if packed_c8:
-        # Fixed-address merged Q and Q4 output use compute dtype, never INT8.
-        copy_sfa_bytes += batch_rows * 4 * copy_sfa_query_heads * 576 * 2
+        # Fixed-address merged Q and output use compute dtype, never INT8.
+        copy_sfa_bytes += batch_rows * query_width * copy_sfa_query_heads * 576 * 2
         if not mtp_full_visible:
-            copy_sfa_bytes += batch_rows * 4 * copy_sfa_query_heads * 512 * 2
+            copy_sfa_bytes += batch_rows * query_width * copy_sfa_query_heads * 512 * 2
         adapter_bytes += batch_rows * (8 * 4 + 2)
     result = SparseKVBudget(
         cache_tokens=cache_tokens,
@@ -234,7 +244,7 @@ def resolve_sparse_kv_budget(
         adapter_bytes=adapter_bytes,
         copy_sfa_bytes=copy_sfa_bytes
         + num_layers * (request_rows + 1) * 8 * bool(device_tail_tokens)
-        + batch_rows * 132 * 17 * bool(device_tail_tokens)
+        + batch_rows * (128 + query_width) * 17 * bool(device_tail_tokens)
         + batch_rows * (device_tail_tokens // 128) * 4,
     )
     if hbm_budget_bytes and result.managed_hbm_bytes > hbm_budget_bytes:

@@ -6,7 +6,7 @@ HANDOFF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FRAMEWORK_ROOT="${FRAMEWORK_ROOT:-$(cd "$HANDOFF_DIR/../../.." && pwd)}"
 KERNEL_ROOT="${KERNEL_ROOT:-$(cd "$FRAMEWORK_ROOT/.." && pwd)/sgl-kernel-npu}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-EXPECTED_BRANCH="${EXPECTED_BRANCH:-feat/a5-copysfa-mtp-radix-20261031}"
+EXPECTED_BRANCH="${EXPECTED_BRANCH:-feat/a5-long-general-q-mtp-20261104}"
 EXPECTED_BASE_REF="${EXPECTED_BASE_REF:-origin/fix/mtp3-draft-hbm-tail-20261031}"
 
 require_file() {
@@ -69,6 +69,27 @@ configure_kv_policy() {
   fi
 }
 
+configure_mtp_geometry() {
+  MTP="${MTP:-1}"
+  MTP_STEPS="${MTP_STEPS:-3}"
+  [[ "$MTP_STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "MTP_STEPS must be positive" >&2; return 2; }
+  MTP_DRAFT_TOKENS="${MTP_DRAFT_TOKENS:-$((MTP_STEPS + 1))}"
+  MTP_TOPK="${MTP_TOPK:-1}"
+  [[ "$MTP" == 0 || "$MTP" == 1 ]] || { echo "MTP must be 0 or 1" >&2; return 2; }
+  local name
+  for name in MTP_STEPS MTP_DRAFT_TOKENS MTP_TOPK; do
+    [[ "${!name}" =~ ^[1-9][0-9]*$ ]] || { echo "$name must be positive" >&2; return 2; }
+  done
+  MTP_QUERY_WIDTH=1
+  if (( MTP )); then
+    (( MTP_TOPK == 1 && MTP_DRAFT_TOKENS >= 2 && MTP_DRAFT_TOKENS <= 14 && MTP_DRAFT_TOKENS == MTP_STEPS + 1 )) || {
+      echo "A5 chain MTP requires topk=1, Q in [2,14], steps=Q-1" >&2; return 2;
+    }
+    MTP_QUERY_WIDTH="$MTP_DRAFT_TOKENS"
+  fi
+  export MTP MTP_STEPS MTP_DRAFT_TOKENS MTP_TOPK MTP_QUERY_WIDTH
+}
+
 configure_profile_mode() {
   [[ "${KV_OFFLOAD:-1}" == 0 || "${KV_OFFLOAD:-1}" == 1 ]] || {
     echo "KV_OFFLOAD must be 0 or 1" >&2; return 2;
@@ -89,10 +110,12 @@ configure_deepep_environment() {
 }
 
 verify_running_server() {
+  configure_mtp_geometry
   run_logged server-state "$PYTHON_BIN" "$HANDOFF_DIR/check_server_state.py" \
     --base-url "${BASE_URL:-http://127.0.0.1:${PORT:-30000}}" \
     --tp "$TP_SIZE" --dp "$ATTN_DP_SIZE" --ep "$EP_SIZE" --batch "$PER_DP_BATCH_SIZE" \
     --mtp "${MTP:-1}" --graph "${GRAPH:-1}" --graph-batch "$GRAPH_BATCH_SIZE" \
+    --mtp-steps "$MTP_STEPS" --mtp-draft-tokens "$MTP_DRAFT_TOKENS" \
     --output "$RUN_DIR/server-state.json"
 }
 

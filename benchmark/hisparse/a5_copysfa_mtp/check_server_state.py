@@ -9,7 +9,19 @@ import urllib.request
 from pathlib import Path
 
 
-def validate(info, *, tp, dp, ep, batch, mtp, graph, graph_batch=None):
+def validate(
+    info,
+    *,
+    tp,
+    dp,
+    ep,
+    batch,
+    mtp,
+    graph,
+    graph_batch=None,
+    mtp_steps=3,
+    mtp_draft_tokens=4,
+):
     errors = []
     states = info.get("internal_states", [])
     if len(states) != dp:
@@ -36,9 +48,9 @@ def validate(info, *, tp, dp, ep, batch, mtp, graph, graph_batch=None):
             if algorithm not in ("NEXTN", "EAGLE"):
                 errors.append(f"DP state {index}: MTP algorithm={algorithm!r}")
             for key, value in (
-                ("speculative_num_steps", 3),
+                ("speculative_num_steps", mtp_steps),
                 ("speculative_eagle_topk", 1),
-                ("speculative_num_draft_tokens", 4),
+                ("speculative_num_draft_tokens", mtp_draft_tokens),
             ):
                 if state.get(key) != value:
                     errors.append(f"DP state {index}: {key} must be {value}")
@@ -71,6 +83,8 @@ def main():
     parser.add_argument("--mtp", type=int, choices=(0, 1), required=True)
     parser.add_argument("--graph", type=int, choices=(0, 1), required=True)
     parser.add_argument("--graph-batch", type=int)
+    parser.add_argument("--mtp-steps", type=int, default=3)
+    parser.add_argument("--mtp-draft-tokens", type=int, default=4)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -87,6 +101,8 @@ def main():
         mtp=args.mtp,
         graph=args.graph,
         graph_batch=args.graph_batch,
+        mtp_steps=args.mtp_steps,
+        mtp_draft_tokens=args.mtp_draft_tokens,
     )
     summary = dict(
         status="fail" if errors else "pass",
@@ -98,6 +114,8 @@ def main():
         requested_batch_per_dp=args.batch,
         global_requests=args.batch * args.dp,
         mtp=args.mtp,
+        mtp_steps=args.mtp_steps if args.mtp else 0,
+        mtp_query_width=args.mtp_draft_tokens if args.mtp else 1,
         graph=args.graph,
         graph_bucket=args.graph_batch or args.batch,
         boundary="Resolved configuration and scheduler capacity; not model accuracy or proof of graph replay",

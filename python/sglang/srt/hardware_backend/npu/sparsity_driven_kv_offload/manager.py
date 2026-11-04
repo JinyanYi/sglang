@@ -41,6 +41,10 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
     is_sparse_mtp_batch,
     prepare_mtp_rows,
 )
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.query_geometry import (
+    configured_a5_query_width,
+    sparse_query_width,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
@@ -130,6 +134,11 @@ class SparseKVCacheManager:
             else token_to_kv_pool_allocator.get_kvcache()
         )
         self.packed_c8 = getattr(pool, "dsa_kv_cache_store_fp8", False)
+        self.max_query_width = 4
+        if self.packed_c8:
+            from sglang.srt.runtime_context import get_spec
+
+            self.max_query_width = configured_a5_query_width(get_spec())
         self.compute_dtype = compute_dtype
         self.separate_mtp_tail = (
             envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get() or self.packed_c8
@@ -301,7 +310,9 @@ class SparseKVCacheManager:
             hd = torch.empty_like(hs)
             hv = torch.empty(hs.numel(), dtype=torch.bool, device=self.device)
             cs = torch.arange(
-                self.batch_capacity * 4, dtype=torch.int64, device=self.device
+                self.batch_capacity * self.max_query_width,
+                dtype=torch.int64,
+                device=self.device,
             )
             cd = torch.empty_like(cs)
             cv = torch.empty(cs.numel(), dtype=torch.bool, device=self.device)
@@ -426,7 +437,7 @@ class SparseKVCacheManager:
                     ):
                         self.mtp_attn_out = torch.empty(
                             (
-                                self.batch_capacity * 4,
+                                self.batch_capacity * self.max_query_width,
                                 copy_sfa_padded_query_heads,
                                 self.kv_lora_rank,
                             ),
@@ -1283,9 +1294,13 @@ class SparseKVCacheManager:
                     workspace=self.tail_workspace,
                     capacity=self.cache_capacity,
                     context_len=self.logical_max_context_len,
-                    query_width=4
-                    if forward_batch.forward_mode.is_target_verify()
-                    else 1,
+                    query_width=(
+                        sparse_query_width(forward_batch)
+                        if self.packed_c8
+                        else 4
+                        if forward_batch.forward_mode.is_target_verify()
+                        else 1
+                    ),
                 )
 
     def get_forward_kv(

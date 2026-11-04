@@ -16,6 +16,7 @@ QUANTIZATION="${QUANTIZATION:-modelslim}"
 SPARSE_CACHE_SIZE="${SPARSE_CACHE_SIZE:-16384}"
 GRAPH="${GRAPH:-1}"
 MTP="${MTP:-1}"
+configure_mtp_geometry
 KV_OFFLOAD="${KV_OFFLOAD:-1}"
 configure_kv_policy
 DEEPEP_MODE="${DEEPEP_MODE:-auto}"
@@ -29,7 +30,7 @@ done
 [[ "$MTP" == 0 || "$MTP" == 1 ]] || { echo "MTP must be 0 or 1" >&2; exit 2; }
 dispatch_batch="$PER_DP_BATCH_SIZE"
 (( GRAPH == 0 )) || dispatch_batch="$GRAPH_BATCH_SIZE"
-dispatch_min=$((dispatch_batch * (1 + 3 * MTP)))
+dispatch_min=$((dispatch_batch * MTP_QUERY_WIDTH))
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-$dispatch_min}"
 [[ "$DEEPEP_MODE" == auto && "$DEEPEP_HYBRID_DEPLOYMENT" == 1 ]] || {
   echo "This joint launcher requires DeepEP auto + hybrid" >&2; exit 2;
@@ -39,8 +40,8 @@ export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${SGLANG_DEEPEP_NUM_MAX_D
   echo "DeepEP dispatch capacity must cover per-DP padded Q tokens ($dispatch_min), at most 1024" >&2; exit 2;
 }
 if (( KV_OFFLOAD )); then
-  (( SPARSE_CACHE_SIZE >= 8192 && SPARSE_CACHE_SIZE <= 32384 && SPARSE_CACHE_SIZE % 128 == 0 )) || {
-  echo "A5 Q4 SPARSE_CACHE_SIZE must be a 128-aligned value in [8192, 32384]" >&2
+  (( SPARSE_CACHE_SIZE >= MTP_QUERY_WIDTH * 2048 && SPARSE_CACHE_SIZE <= 32384 && SPARSE_CACHE_SIZE % 128 == 0 )) || {
+  echo "A5 long-request SPARSE_CACHE_SIZE must be 128-aligned, >= Q*2048 and <=32384 (Q=$MTP_QUERY_WIDTH)" >&2
   exit 2
   }
 fi
@@ -60,8 +61,8 @@ args=("$PYTHON_BIN" -m sglang.launch_server
 [[ -z "$QUANTIZATION" || "$QUANTIZATION" == none ]] || args+=(--quantization "$QUANTIZATION")
 [[ -z "${MAX_TOTAL_TOKENS:-}" ]] || args+=(--max-total-tokens "$MAX_TOTAL_TOKENS")
 if (( MTP )); then
-  args+=(--speculative-algorithm NEXTN --speculative-num-steps 3
-    --speculative-eagle-topk 1 --speculative-num-draft-tokens 4)
+  args+=(--speculative-algorithm NEXTN --speculative-num-steps "$MTP_STEPS"
+    --speculative-eagle-topk "$MTP_TOPK" --speculative-num-draft-tokens "$MTP_DRAFT_TOKENS")
 fi
 if (( GRAPH )); then
   args+=(--cuda-graph-bs-decode "$GRAPH_BATCH_SIZE")

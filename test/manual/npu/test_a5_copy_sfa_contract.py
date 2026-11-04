@@ -32,6 +32,7 @@ def extract(path, names, namespace):
 WRAPPER = load_plain(ROOT / "python/sglang/kernels/ops/attention/npu_quant_sparse.py")
 BUDGET = load_plain(SOURCE / "budget.py")
 MTP = load_plain(SOURCE / "mtp.py")
+GEOMETRY = load_plain(SOURCE / "query_geometry.py")
 
 
 def plan_type(*args):
@@ -52,7 +53,7 @@ def plan_type(*args):
 
 
 class TestA5CallerContract(unittest.TestCase):
-    def bridge(self):
+    def bridge(self, width=4):
         self.calls = []
 
         def native(*args):
@@ -75,6 +76,7 @@ class TestA5CallerContract(unittest.TestCase):
             LIMSelection=plan_type,
             prepare_mtp_rows=MTP.prepare_mtp_rows,
             validate_mtp_chain=lambda *args: None,
+            sparse_query_width=GEOMETRY.sparse_query_width,
         )
         bridge_cls = extract(SOURCE / "c8_lim_bridge.py", {"C8LIMBridge"}, namespace)[
             "C8LIMBridge"
@@ -83,6 +85,7 @@ class TestA5CallerContract(unittest.TestCase):
             cache_capacity=8192,
             size=4,
             batch_capacity=2,
+            max_query_width=width,
             max_context_len=8704,
             logical_max_context_len=8704,
             device="cpu",
@@ -93,10 +96,12 @@ class TestA5CallerContract(unittest.TestCase):
         return bridge_cls(manager), manager
 
     def select(self, width, requests=(1, 0)):
-        bridge, manager = self.bridge()
+        bridge, manager = self.bridge(max(4, width))
         rows = len(requests) * width
         mode = SimpleNamespace(
-            is_target_verify=lambda: width == 4, is_draft_extend_v2=lambda: False
+            is_target_verify=lambda: width > 1,
+            is_decode=lambda: width == 1,
+            is_draft_extend_v2=lambda: False,
         )
         positions = (torch.tensor([8445, 0])[:, None] + torch.arange(width)).flatten()
         batch = SimpleNamespace(
@@ -111,7 +116,7 @@ class TestA5CallerContract(unittest.TestCase):
         query = torch.zeros(rows, 32, 128, dtype=torch.float8_e4m3fn)
         qs = torch.arange(rows * 32, dtype=torch.float32).view(rows, 32) + 1
         ks = torch.ones(68, 128, 1, dtype=torch.float32) * 3
-        call = bridge.select_mtp if width == 4 else bridge.select
+        call = bridge.select_mtp if width > 1 else bridge.select
         plan = call(
             manager,
             query=query,
@@ -144,6 +149,20 @@ class TestA5CallerContract(unittest.TestCase):
         _, _, _, plan, _, _ = self.select(1)
         self.assertEqual(self.calls[-1][6].tolist(), [1, 2])
         self.assertEqual(plan.source_ids.shape, (2, 2048))
+
+    def test_actual_width_sets_endpoints_and_padding_without_losing_scales(self):
+        for width in (2, 3, 5, 6, 8, 14):
+            with self.subTest(width=width):
+                bridge, _, _, plan, qs, ks = self.select(width)
+                call = self.calls[-1]
+                self.assertEqual(call[6].tolist(), [width, 2 * width])
+                self.assertEqual(plan.source_ids.shape, (2 * width, 2048))
+                self.assertEqual(plan.seq_lens.tolist(), [8445 + width, 0])
+                self.assertTrue((plan.source_ids[width:] == -1).all())
+                self.assertTrue((plan.device_slots[width:] == -1).all())
+                torch.testing.assert_close(call[1], qs)
+                torch.testing.assert_close(call[3], ks)
+                self.assertEqual(bridge.sources.shape[0], 2 * max(4, width))
 
     def test_post_metadata_preserves_real_lengths_and_rotates_odd_tail_page(self):
         bridge, manager, _, plan, _, _ = self.select(4)
@@ -212,6 +231,7 @@ class TestA5CallerContract(unittest.TestCase):
         namespace = dict(
             torch=torch,
             load_quant_copy_sfa_operator=lambda: object(),
+            sparse_query_width=GEOMETRY.sparse_query_width,
             fused_quant_scatter_copy_sparse_flash_attention=lambda *a, **kw: (
                 received.append(a),
                 a[-1].fill_(2),
@@ -220,6 +240,7 @@ class TestA5CallerContract(unittest.TestCase):
         cache_cls = extract(SOURCE / "c8.py", {"C8Cache"}, namespace)["C8Cache"]
         manager = SimpleNamespace(
             batch_capacity=2,
+            max_query_width=4,
             device="cpu",
             start_layer=0,
             lim_adapter=SimpleNamespace(copy_sfa_metadata=lambda *a: None),

@@ -12,6 +12,9 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
     use_native_mtp_verify,
 )
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.query_geometry import (
+    sparse_query_width,
+)
 
 PACKED_ROW_BYTES = 656
 
@@ -33,8 +36,9 @@ def _eager_c8_request_ids(batch):
 class C8Cache:
     def __init__(self, manager, query_heads, compute_dtype):
         self.operator = load_quant_copy_sfa_operator()
+        self.max_query_width = manager.max_query_width
         self.query = torch.empty(
-            (manager.batch_capacity * 4, query_heads, 576),
+            (manager.batch_capacity * self.max_query_width, query_heads, 576),
             dtype=compute_dtype,
             device=manager.device,
         )
@@ -46,14 +50,21 @@ class C8Cache:
                 dtype=torch.int32,
                 device=manager.device,
             )
-            for q in (1, 4)
+            for q in range(1, self.max_query_width + 1)
         }
 
     def attention(self, manager, layer, batch, q, q_rope, plan):
         if plan is None:
             raise RuntimeError("A5 CopySFA requires a plan from the external A5 LIM")
         count = batch.batch_size
-        width = plan.source_ids.shape[0] // count
+        width = sparse_query_width(batch)
+        if (
+            not 1 <= width <= self.max_query_width
+            or plan.source_ids.shape[0] != count * width
+            or q.shape[0] < count * width
+            or q_rope.shape[0] < count * width
+        ):
+            raise ValueError("A5 CopySFA plan exceeds its configured query capacity")
         rows = count * width
         manager.lim_adapter.copy_sfa_metadata(manager, plan)
         heads = layer.tp_q_head_num
@@ -96,7 +107,7 @@ class C8Cache:
 def forward_c8_offload(
     backend, q, k, layer, batch, save_kv_cache, q_rope, k_rope, topk_indices
 ):
-    """Use Q1/Q4 CopySFA for long targets; prefill/short rows use vendor QSFA."""
+    """Use CopySFA for long target chains; preserve the eager QSFA fallback."""
     import torch_npu
 
     manager = backend.sparse_kv_manager
@@ -136,15 +147,19 @@ def forward_c8_offload(
         or batch.forward_mode.is_decode()
     ):
         raise ValueError(
-            "A5 offload supports target prefill, Q1 decode and Q4 verify; draft stays native"
+            "A5 offload supports target prefill, Q1 decode and chain verify; draft stays native"
         )
     if backend.graph_mode:
         raise RuntimeError("Short A5 target rows must use the eager QSFA fallback")
     manager.lim_adapter.reset_requests(batch.req_pool_indices)
     reqs_cpu = _eager_c8_request_ids(batch)
     if batch.forward_mode.is_target_verify():
+        width = sparse_query_width(batch)
         lengths = (
-            batch.positions[: batch.batch_size * 4].view(batch.batch_size, 4)[:, -1] + 1
+            batch.positions[: batch.batch_size * width].view(batch.batch_size, width)[
+                :, -1
+            ]
+            + 1
         )
         kv_lengths = torch.where(batch.seq_lens > 0, lengths, 0).to(torch.int32)
         # Short verification uses the eager vendor path, never graph replay.
@@ -205,7 +220,7 @@ def forward_c8_offload(
         if batch.forward_mode.is_extend_without_speculative():
             ends = batch.extend_seq_lens.cumsum(0)
         else:
-            width = 4 if batch.forward_mode.is_target_verify() else 1
+            width = sparse_query_width(batch)
             ends = manager.c8_cache.query_ends[width][: batch.batch_size]
     merged = torch.cat(
         (q.reshape(-1, q.shape[-2], 512), q_rope.reshape(-1, q_rope.shape[-2], 64)),

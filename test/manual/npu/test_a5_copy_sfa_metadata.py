@@ -12,7 +12,7 @@ def require_npu():
     torch.npu.set_device(0)
 
 
-@pytest.mark.parametrize("width", [1, 4])
+@pytest.mark.parametrize("width", [1, 2, 3, 4, 5, 6, 8, 14])
 @pytest.mark.parametrize("graph_replay", [False, True])
 def test_a5_pre_post_metadata(width, graph_replay):
     from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_copy_sfa_metadata import (
@@ -129,7 +129,7 @@ def test_a5_pre_post_metadata(width, graph_replay):
             torch.testing.assert_close(dram[row].cpu(), src_table[row].cpu())
 
 
-@pytest.mark.parametrize("width", [1, 4])
+@pytest.mark.parametrize("width", [1, 2, 3, 4, 5, 6, 8, 14])
 @pytest.mark.parametrize("graph_replay", [False, True])
 def test_a5_c8_tail_payload(width, graph_replay):
     from sgl_kernel_npu.sparsity_driven_kv_offload import create_shm_tensor, free_shm
@@ -161,9 +161,9 @@ def test_a5_c8_tail_payload(width, graph_replay):
         hs = torch.empty(128, dtype=torch.int64, device="npu")
         hd = torch.empty_like(hs)
         hv = torch.empty(128, dtype=torch.bool, device="npu")
-        cs = torch.arange(4, device="npu")
+        cs = torch.arange(width, device="npu")
         cd = torch.empty_like(cs)
-        cv = torch.empty(4, dtype=torch.bool, device="npu")
+        cv = torch.empty(width, dtype=torch.bool, device="npu")
 
         def launch():
             stage_mtp_tail(

@@ -15,6 +15,9 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.budget import (
     resolve_sparse_kv_budget,
     sparse_batch_capacity,
 )
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.query_geometry import (
+    configured_a5_query_width,
+)
 from sglang.srt.runtime_context import (
     attention_backends,
     get_disagg,
@@ -121,6 +124,7 @@ def is_sparsity_driven_kv_offload_enabled(
 
         if not is_npu_arch35():
             raise ValueError("A5 C8 CopySFA requires Ascend950")
+        configured_a5_query_width(get_spec())
         if indexer_impl != "lim" or not envs.SGLANG_NPU_ENABLE_COPY_SFA.get():
             raise ValueError("A5 C8 target offload requires native LIM and CopySFA")
         if (
@@ -228,12 +232,13 @@ def get_sparse_kv_budget(
         mtp_full_visible=(
             envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
             or envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get()
-            or (packed_c8 and get_spec().speculative_num_draft_tokens == 4)
+            or (packed_c8 and configured_a5_query_width(get_spec()) > 1)
         ),
         device_tail_tokens=256
         if packed_c8 or envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get()
         else 0,
         packed_c8=packed_c8,
+        max_query_width=configured_a5_query_width(get_spec()) if packed_c8 else 4,
         fused_copy_sfa_metadata=envs.SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA.get(),
         fused_pre_metadata=envs.SGLANG_NPU_FUSED_LIM_PRE_METADATA.get(),
         graph_batch_capacity=sparse_batch_capacity(

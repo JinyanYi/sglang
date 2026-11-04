@@ -21,6 +21,7 @@ run_logged framework_source_cpu "$PYTHON_BIN" -m pytest -q \
   "$FRAMEWORK_ROOT/test/manual/npu/test_c8_eager_metadata_cpu.py" \
   "$FRAMEWORK_ROOT/test/manual/npu/test_a5_article_report_cpu.py" \
   "$FRAMEWORK_ROOT/test/manual/npu/test_a5_no_offload_launcher_cpu.py" \
+  "$FRAMEWORK_ROOT/test/manual/npu/test_a5_query_geometry_cpu.py" \
   "$FRAMEWORK_ROOT/test/manual/npu/test_a5_copy_sfa_contract.py" \
   "$FRAMEWORK_ROOT/test/manual/npu/test_sparse_kv_offload_cache.py"
 

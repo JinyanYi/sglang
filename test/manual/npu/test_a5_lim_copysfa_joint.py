@@ -15,7 +15,7 @@ import torch
 pytest.importorskip("torch_npu")
 
 
-@pytest.mark.parametrize("width", [1, 4])
+@pytest.mark.parametrize("width", [1, 2, 3, 4, 5, 6, 8, 14])
 @pytest.mark.parametrize("graph_mode", [False, True])
 def test_real_lim_to_copysfa(width, graph_mode):
     import acl
@@ -34,8 +34,9 @@ def test_real_lim_to_copysfa(width, graph_mode):
         unpack_rows,
     )
 
-    prefix, capacity = 8320, 8192
-    final_length = prefix + (129 if width == 4 else 127)
+    capacity = max(8192, width * 2048)
+    prefix = capacity + 128
+    final_length = prefix + 128 + width - 3 if width > 1 else prefix + 127
     source_capacity = (final_length + 127) // 128 * 128
     pages = source_capacity // 128
     device = "npu"

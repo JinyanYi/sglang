@@ -12,7 +12,7 @@ import torch
 pytest.importorskip("torch_npu")
 
 
-@pytest.mark.parametrize("width", [1, 4])
+@pytest.mark.parametrize("width", [1, 2, 3, 4, 5, 6, 8, 14])
 @pytest.mark.parametrize("graph_replay", [False, True])
 @pytest.mark.parametrize("capacity", [8192, 16384, 32384])
 def test_packed_tail_acceptance_reuse_and_page_crossing(width, graph_replay, capacity):
