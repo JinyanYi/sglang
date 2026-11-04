@@ -86,10 +86,19 @@ class AscendTransferEngine(MooncakeTransferEngine):
     def batch_register(self, ptrs: List[int], lengths: List[int]):
         try:
             ret_value = self.engine.batch_register_memory(ptrs, lengths)
-        except Exception:
+        except Exception as error:
+            if os.getenv("SGLANG_NPU_A5_PD_MF", "0") == "1":
+                raise RuntimeError(
+                    "A5 P/D MF memory registration raised an exception"
+                ) from error
             # Mark register as failed
             ret_value = -1
         if ret_value != 0:
+            if os.getenv("SGLANG_NPU_A5_PD_MF", "0") == "1":
+                raise RuntimeError(
+                    "A5 packed C8 P/D MF memory registration failed; "
+                    "check the MF/HDK/LingQu stack and registered GVA ranges"
+                )
             logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
 
     @staticmethod
@@ -101,6 +110,11 @@ class AscendTransferEngine(MooncakeTransferEngine):
     def _resolve_trans_op_type(protocol: str):
         op_type = getattr(TransferEngine.TransDataOpType, protocol.upper(), None)
         if op_type is None:
+            if os.getenv("SGLANG_NPU_A5_PD_MF", "0") == "1":
+                raise ValueError(
+                    f"A5 P/D requires MF protocol {protocol!r}; "
+                    "the installed memfabric_hybrid does not provide it"
+                )
             logger.warning(
                 "Transfer protocol %r is not supported by the installed "
                 "memfabric_hybrid, falling back to %r.",

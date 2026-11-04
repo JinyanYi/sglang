@@ -1,0 +1,32 @@
+{
+  "branch": "feat/a5-pd-split-kv-20261104",
+  "framework_base": "a01b4dfc1b601de684f3bb8ca67e5627c7c4b368",
+  "kernel_base": "138319bddb54bec3333e92fb6d072a74c540293a",
+  "donor_framework_tip": "db62a4d7e7688284797406ebca193147f41e5e0e",
+  "donor_runtime_change": "cb851d4a6e46cc338ddb7a5a46ec91e416367478",
+  "donor_user_reported_server": "254fce935dd622905406a3a6a3c1c5705127ac56",
+  "donor_user_reported_driver": "dd2fe408d770334f467b64955ae9d64954012424",
+  "donor_user_reported_kernel": "b47332ce9736a7920139ad8f29364b27ef416dea",
+  "storage": "MF SHARED, attention-TP local, packed int8 656 bytes per token",
+  "copy_sfa_abi_changed": false,
+  "target_offload": true,
+  "draft_offload": false,
+  "mtp": [
+    3,
+    1,
+    4
+  ],
+  "graph_on_decode": true,
+  "decode_radix_cache": true,
+  "a5_mf_hdk_lcne_versions": "Pending provider-confirmed compatibility bundle",
+  "validation": {
+    "cpu_tests": "47 passed, exit 0; 17 new P/D checks and 30 existing script regressions",
+    "a5_build": "Not run; existing A5 operator code unchanged",
+    "a5_mf_local_probe": "Not run",
+    "a5_mf_tp_probe": "Not run",
+    "a5_pd_accuracy": "Not run",
+    "a5_pd_graph_mtp_radix": "Not run",
+    "a5_pd_performance": "Not run"
+  },
+  "donor_kernel_tip": "983e77bb6da8d08aa93913e2e69e2901fd9b3630"
+}

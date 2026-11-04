@@ -60,6 +60,9 @@ def is_sparsity_driven_kv_offload_enabled(
     # pool even though the process inherits the target's environment flags.
     if is_draft_worker:
         return False
+    if envs.SGLANG_NPU_A5_PD_MF.get() and get_disagg().disaggregation_mode == "prefill":
+        # P produces the native packed HBM pages. Only D owns the host pool.
+        return False
     indexer_impl = get_sparse_kv_indexer_impl()
     if (
         envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
@@ -123,11 +126,18 @@ def is_sparsity_driven_kv_offload_enabled(
             raise ValueError("A5 C8 CopySFA requires Ascend950")
         if indexer_impl != "lim" or not envs.SGLANG_NPU_ENABLE_COPY_SFA.get():
             raise ValueError("A5 C8 target offload requires native LIM and CopySFA")
-        if (
-            get_parallel().attn_cp_size != 1
-            or get_disagg().disaggregation_mode != "null"
+        if get_parallel().attn_cp_size != 1:
+            raise ValueError("A5 C8 integration requires CP=1")
+        mode = get_disagg().disaggregation_mode
+        if mode != "null" and not (
+            mode == "decode"
+            and envs.SGLANG_NPU_A5_PD_MF.get()
+            and get_disagg().disaggregation_transfer_backend == "ascend"
         ):
-            raise ValueError("A5 C8 integration requires colocated execution and CP=1")
+            raise ValueError(
+                "A5 C8 P/D requires the Ascend transfer backend and "
+                "SGLANG_NPU_A5_PD_MF=1 on decode"
+            )
     return True
 
 

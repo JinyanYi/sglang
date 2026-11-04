@@ -1056,6 +1056,8 @@ class Envs:
     # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.
     SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
+    # Opt-in MF-backed packed C8 receive pool for Ascend P/D.
+    SGLANG_NPU_A5_PD_MF = EnvBool(False)
     # Per-request resident token capacity; 0 defaults to model TopK or auto-sizes
     # from the manager HBM budget. Legacy/reference use LRU when C > K;
     # native LIM maintains its own resident mapping.

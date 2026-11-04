@@ -69,6 +69,23 @@ else
   args+=(--disable-cuda-graph)
 fi
 
+# Optional two-node P/D handoff. The colocated invocation remains unchanged.
+case "${PD_ROLE:-null}" in
+  null) ;;
+  prefill|decode)
+    args+=(--disaggregation-mode "$PD_ROLE"
+      --disaggregation-transfer-backend ascend
+      --disaggregation-bootstrap-port "${PD_BOOTSTRAP_PORT:-8998}"
+      --enable-cache-report)
+    if [[ "$PD_ROLE" == decode ]]; then
+      args+=(--disaggregation-decode-extra-slots 0
+        --disaggregation-decode-retraction-backup cpu_tensor)
+      [[ "${PD_DECODE_RADIX:-1}" == 0 ]] || args+=(--disaggregation-decode-enable-radix-cache)
+    fi
+    ;;
+  *) echo "PD_ROLE must be null, prefill or decode" >&2; exit 2 ;;
+esac
+
 if [[ "${1:-}" == --dry-run ]]; then
   printf 'world=%s attention_DP=%s attention_TP=%s EP=%s per_DP_batch=%s global_requests=%s graph_bucket=%s DeepEP_dispatch_capacity=%s\n' "$TP_SIZE" "$ATTN_DP_SIZE" "$((TP_SIZE / ATTN_DP_SIZE))" "$EP_SIZE" "$PER_DP_BATCH_SIZE" "$MAX_RUNNING_REQUESTS" "$GRAPH_BATCH_SIZE" "$SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"
   printf 'radix=enabled KV_OFFLOAD=%s indexer=%s copy_sfa=%s metadata_fusions=%s MTP=%s GRAPH=%s draft_offload=disabled profile=off\n' "$KV_OFFLOAD" "$SGLANG_NPU_SPARSE_KV_INDEXER" "$SGLANG_NPU_ENABLE_COPY_SFA" "$SGLANG_NPU_FUSED_LIM_PRE_METADATA" "$MTP" "$GRAPH"

@@ -468,9 +468,39 @@ class SparseKVCacheManager:
         )
         logger.info("Sparse KV host buffer shape: %s", host_kv_shape)
         device_id = torch.npu.current_device()
+        self.mf_host_pool = None
+        if envs.SGLANG_NPU_A5_PD_MF.get():
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.a5_pd_pool import (
+                A5PackedMFPool,
+            )
+            from sglang.srt.runtime_context import get_disagg, get_parallel
 
+            if not self.packed_c8 or get_disagg().disaggregation_mode != "decode":
+                raise ValueError("A5 MF sparse storage requires packed C8 decode P/D")
+            self.mf_host_pool = A5PackedMFPool(
+                tokens=self.host_token_capacity,
+                layers=self.layer_num,
+                device=self.device,
+                group=get_parallel().attn_tp_group,
+            )
+            logger.info(
+                "A5 P/D MF packed C8 pool: attention-TP rank=%d/%d, "
+                "physical DRAM owner=0, tokens=%d, layers=%d",
+                self.mf_host_pool.rank,
+                self.mf_host_pool.group.world_size,
+                self.host_token_capacity,
+                self.layer_num,
+            )
         try:
             for layer_idx in range(self.layer_num):
+                if self.mf_host_pool is not None:
+                    tensor = self.mf_host_pool.packed[layer_idx].view(host_kv_shape)
+                    self.host_kv_buffer.append(tensor)
+                    # MF supplies a device-accessible GVA; do not register this
+                    # allocation again with aclrtHostRegister.
+                    self.host_ptr_list.append(tensor.data_ptr())
+                    self.dev_ptr_list.append(tensor.data_ptr())
+                    continue
                 shm_cpu_tensor, host_ptr, dev_ptr = create_shm_tensor(
                     shape=host_kv_shape,
                     dtype=self.store_dtype,
@@ -559,6 +589,12 @@ class SparseKVCacheManager:
         """Mirror accepted-token compaction before native physical IDs recycle."""
         if not getattr(self, "host_kv_is_paged", False) or source.numel() == 0:
             return
+        if getattr(self, "mf_host_pool", None) is not None:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.a5_pd import (
+                move_packed_kv,
+            )
+
+            return move_packed_kv(self, target, source)
         count = source.numel()
         scratch = torch.empty(
             (count, self.head_num, self.head_dim),
@@ -1250,17 +1286,24 @@ class SparseKVCacheManager:
 
         actual_stream = stream if stream is not None else torch.npu.current_stream()
         with torch.npu.stream(actual_stream):
-            unidex_copy_inplace(
-                src_tensor,
-                dst_tensor,
-                src_index,
-                dst_index,
-                valid_mask,
-                1,  # src_tensor: [num_new_tokens, nhead, head_dim]
-                2,  # dst_tensor: [num_req, max_context_len, nhead, head_dim]
-                block_dim=48,
-                dst_ptr=self.dev_ptr_list[layer_idx],
-            )
+            if getattr(self, "mf_host_pool", None) is not None:
+                if self.mf_host_pool.rank == 0:
+                    self.mf_host_pool.copy_rows(
+                        [src_tensor], [dst_tensor], src_index, dst_index, valid_mask
+                    )
+                self.mf_host_pool.publish()
+            else:
+                unidex_copy_inplace(
+                    src_tensor,
+                    dst_tensor,
+                    src_index,
+                    dst_index,
+                    valid_mask,
+                    1,  # src_tensor: [num_new_tokens, nhead, head_dim]
+                    2,  # dst_tensor: [num_req, max_context_len, nhead, head_dim]
+                    block_dim=48,
+                    dst_ptr=self.dev_ptr_list[layer_idx],
+                )
 
             if getattr(self, "separate_mtp_tail", False) and (
                 forward_batch.forward_mode.is_target_verify()

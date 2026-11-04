@@ -14,7 +14,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import is_npu
 
@@ -670,7 +670,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
         self.enable_sparsity_driven_kv_offload = (
-            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get() and not is_draft_worker
+            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
+            and not is_draft_worker
+            and not (
+                envs.SGLANG_NPU_A5_PD_MF.get()
+                and get_disagg().disaggregation_mode == "prefill"
+            )
         )
         if self.enable_sparsity_driven_kv_offload and self.index_head_dim is None:
             raise ValueError("Sparsity-driven KV offload requires an index KV cache.")
@@ -872,6 +877,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 "path, or re-enable native device KV cache for this code path."
             )
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        manager = getattr(self, "sparse_kv_manager", None)
+        if getattr(manager, "mf_host_pool", None) is None:
+            return super().move_kv_cache(tgt_loc, src_loc)
+        # NPU split pools do not own MLATokenToKVPool.kv_buffer. Accepted-token
+        # LI state is handled by the indexer; relocate the opaque host payload.
+        if src_loc.numel():
+            manager.move_host_kv(tgt_loc.reshape(-1).long(), src_loc.reshape(-1).long())
+
     def get_kv_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
@@ -939,6 +953,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def _get_disagg_buffer_entries(self):
         """Return (buffer, uses_global_slots) entries in PD transfer order."""
+        manager = getattr(self, "sparse_kv_manager", None)
+        if getattr(manager, "mf_host_pool", None) is not None:
+            entries = [
+                (buffer.view(-1, 128, 1, 656), True)
+                for buffer in manager.host_kv_buffer
+            ]
+            entries += [(buffer, True) for buffer in self.index_k_buffer]
+            entries += [(buffer, True) for buffer in self.index_k_scale_buffer]
+            return entries
         self._raise_if_native_kv_cache_disabled()
         global_kv = self.is_draft_worker
         entries = [(buffer, global_kv) for buffer in self.k_buffer]
@@ -971,7 +994,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def get_kv_layer_ids(self):
         return (
-            list(range(self.start_layer, self.start_layer + self.layer_num)) * 2
+            list(range(self.start_layer, self.start_layer + self.layer_num))
+            * (1 if self.dsa_kv_cache_store_fp8 else 2)
             + self.get_state_layer_ids()
         )
 
@@ -1146,6 +1170,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return buffers
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        manager = getattr(self, "sparse_kv_manager", None)
+        if getattr(manager, "mf_host_pool", None) is not None:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.a5_pd import (
+                snapshot_packed_kv,
+            )
+
+            return snapshot_packed_kv(self, indices)
         torch.npu.synchronize()
         buf_of_layers = [
             self._get_cpu_offload_layer_buffers(i) for i in range(self.layer_num)
@@ -1168,6 +1199,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
+        manager = getattr(self, "sparse_kv_manager", None)
+        if getattr(manager, "mf_host_pool", None) is not None:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.a5_pd import (
+                restore_packed_kv,
+            )
+
+            return restore_packed_kv(self, kv_cache_cpu, indices, req_pool_index)
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for local_layer_id in range(self.layer_num):
