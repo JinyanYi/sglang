@@ -25,7 +25,6 @@ class A5PackedMFPool:
             raise ValueError("A5 MF requires positive layers and 128-aligned tokens")
         from memfabric_hybrid import offload
 
-        self.offload = offload
         self.group = group
         self.rank = self.group.rank_in_group
         self.device = device
@@ -101,7 +100,9 @@ class A5PackedMFPool:
         self.group.broadcast(self._publish_fence, src=0)
 
     def copy_rows(self, sources, destinations, source_rows, destination_rows, valid):
-        """Enqueue byte-addressed MF sparse copies on the current NPU stream."""
+        """Copy packed rows through the device-visible MF addresses."""
+        from sgl_kernel_npu.sparsity_driven_kv_offload import unidex_copy_inplace
+
         if len(sources) != len(destinations) or not sources:
             raise ValueError(
                 "Sparse KV copies require matching nonempty component lists"
@@ -114,11 +115,7 @@ class A5PackedMFPool:
             raise ValueError(
                 "Sparse KV row indices and validity must be matching vectors"
             )
-        src, dst, lengths = [], [], []
-        safe_src = torch.where(valid, source_rows, 0).to(torch.int64)
-        safe_dst = torch.where(valid, destination_rows, 0).to(torch.int64)
         for source, destination in zip(sources, destinations):
-            row_bytes = source.shape[-1] * source.element_size()
             if (
                 destination.shape[-1] != source.shape[-1]
                 or destination.dtype != source.dtype
@@ -130,18 +127,23 @@ class A5PackedMFPool:
                 raise ValueError(
                     "Sparse KV copies require contiguous component buffers"
                 )
-            # Mask addresses as well as lengths; padded rows may contain -1.
-            src.append(safe_src * row_bytes + source.data_ptr())
-            dst.append(safe_dst * row_bytes + destination.data_ptr())
-            lengths.append(valid.to(torch.int32) * row_bytes)
         if source_rows.numel() == 0:
             return
-        src = torch.cat(src).contiguous()
-        dst = torch.cat(dst).contiguous()
-        lengths = torch.cat(lengths).contiguous()
-        count = torch.full(
-            (1,), src.numel(), dtype=torch.int32, device=source_rows.device
-        )
-        result = self.offload.sparse_copy(src, dst, lengths, count, source_rows.device)
-        if result not in (None, 0):
-            raise RuntimeError(f"Sparse KV MF sparse_copy failed: {result}")
+        source_rows = source_rows.to(torch.int64).contiguous()
+        destination_rows = destination_rows.to(torch.int64).contiguous()
+        valid = valid.contiguous()
+        # MF's paired copy uses the first row width as the second UB offset.
+        # The packed C8 width (656 bytes) is not 32-byte aligned.
+        for source, destination in zip(sources, destinations):
+            unidex_copy_inplace(
+                source.view(-1, source.shape[-1]),
+                destination.view(-1, destination.shape[-1]),
+                source_rows,
+                destination_rows,
+                valid,
+                1,
+                1,
+                block_dim=48,
+                src_ptr=source.data_ptr() if source.is_cpu else None,
+                dst_ptr=destination.data_ptr() if destination.is_cpu else None,
+            )

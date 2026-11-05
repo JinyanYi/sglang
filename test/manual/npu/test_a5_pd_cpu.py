@@ -1,7 +1,6 @@
 """CPU byte/ordering checks for the A5 MF adaptation; no NPU acceptance."""
 
 import ast
-import ctypes
 import hashlib
 import importlib.util
 import json
@@ -68,11 +67,17 @@ class Offload:
         self.allocations.append(tensor)
         return tensor
 
-    def sparse_copy(self, src, dst, lengths, count, device):
-        for source, target, length in zip(src.tolist(), dst.tolist(), lengths.tolist()):
-            if length:
-                ctypes.memmove(target, source, length)
-        return 0
+
+def copy_rows(src, dst, src_rows, dst_rows, valid, src_ndims, dst_ndims, **kwargs):
+    assert src_ndims == dst_ndims == 1
+    assert src.ndim == dst.ndim == 2
+    assert kwargs["src_ptr"] == src.data_ptr()
+    assert kwargs["dst_ptr"] == dst.data_ptr()
+    for source, target, enabled in zip(
+        src_rows.tolist(), dst_rows.tolist(), valid.tolist()
+    ):
+        if enabled:
+            dst[target].copy_(src[source])
 
 
 @pytest.fixture
@@ -81,6 +86,9 @@ def shared(monkeypatch):
     module = ModuleType("memfabric_hybrid")
     module.offload = offload
     monkeypatch.setitem(sys.modules, "memfabric_hybrid", module)
+    kernel = ModuleType("sgl_kernel_npu.sparsity_driven_kv_offload")
+    kernel.unidex_copy_inplace = copy_rows
+    monkeypatch.setitem(sys.modules, kernel.__name__, kernel)
     monkeypatch.setattr(
         torch,
         "npu",
@@ -116,19 +124,17 @@ def test_one_physical_owner_byte_alias_and_page_offsets(shared):
 def test_masked_cross_page_copies_and_errors(shared):
     owner, _, _ = shared
     host = owner.packed[0]
-    source = torch.arange(3 * 656).remainder(127).to(torch.int8).view(3, 1, 656)
-    old, new = torch.tensor([0, -1, 2]), torch.tensor([127, -1, 128])
-    valid = torch.tensor([True, False, True])
+    source = torch.arange(64 * 656).remainder(127).to(torch.int8).view(64, 1, 656)
+    valid = torch.arange(64) % 2 == 0
+    old = torch.where(valid, torch.arange(64), -1)
+    new = torch.where(valid, old + 127, -1)
     owner.copy_rows([source], [host], old, new, valid)
     got = torch.zeros_like(source)
     owner.copy_rows([host], [got], new, old, valid)
-    torch.testing.assert_close(got[[0, 2]], source[[0, 2]], rtol=0, atol=0)
-    assert not got[1].any()
+    torch.testing.assert_close(got[valid], source[valid], rtol=0, atol=0)
+    assert not got[~valid].any()
     with pytest.raises(ValueError, match="widths and dtypes"):
         owner.copy_rows([source], [host[..., :655]], old, new, valid)
-    owner.offload.sparse_copy = lambda *args: 17
-    with pytest.raises(RuntimeError, match="17"):
-        owner.copy_rows([source], [host], old, new, valid)
 
 
 def make_pool(shared):

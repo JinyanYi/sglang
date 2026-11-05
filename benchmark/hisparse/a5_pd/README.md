@@ -43,7 +43,7 @@ the same compatible runtime. A different CANN/torch ABI can still require a
 rebuild with `benchmark/hisparse/a5_copysfa_mtp/10_build_kernel.sh`.
 
 Additional requirements are an **A5-compatible** `memfabric_hybrid` containing
-`offload.OffloadConfig`, `Scene.SHARED`, `offload.empty`, `offload.sparse_copy`,
+`offload.OffloadConfig`, `Scene.SHARED`, `offload.empty`,
 and the selected `TransferEngine.TransDataOpType`, plus a matching
 `sglang_router` supporting `--pd-disaggregation --dp-aware`. `doctor.py` records
 package locations/versions and driver version files and checks API presence.

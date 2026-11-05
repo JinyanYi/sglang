@@ -6,7 +6,6 @@ import os
 import torch
 import torch.distributed as dist
 import torch_npu  # noqa: F401
-from sgl_kernel_npu.sparsity_driven_kv_offload import unidex_copy_inplace
 
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.a5_pd_pool import (
     A5PackedMFPool,
@@ -43,33 +42,32 @@ def main():
     device = f"npu:{local}"
     group = ProbeGroup()
     pool = A5PackedMFPool(tokens=384, layers=2, device=device, group=group)
-    source = torch.arange(4 * 656, dtype=torch.int32).remainder(127).to(torch.int8)
-    source = source.reshape(4, 1, 656).to(device)
+    source = torch.arange(64 * 656, dtype=torch.int32).remainder(127).to(torch.int8)
+    source = source.reshape(64, 1, 656).to(device)
     result = torch.empty_like(source)
-    indices = torch.tensor([1, 127, 128, 255], dtype=torch.int64, device=device)
-    rows = torch.arange(4, dtype=torch.int64, device=device)
-    valid = torch.ones(4, dtype=torch.bool, device=device)
+    rows = torch.arange(64, dtype=torch.int64, device=device)
+    valid_cpu = torch.zeros(64, dtype=torch.bool)
+    valid_cpu[[0, 1, 8, 9]] = True
+    valid = valid_cpu.to(device)
+    indices = torch.where(valid, rows + 120, -1)
+
+    def check():
+        expected = source.cpu()
+        expected[~valid_cpu] = 0
+        torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
     for layer, host in enumerate(pool.packed):
 
         def enqueue():
             if pool.rank == 0:
                 pool.copy_rows([source], [host], rows, indices, valid)
             pool.publish()
-            unidex_copy_inplace(
-                host.view(-1, 1, 656),
-                result,
-                indices,
-                rows,
-                valid,
-                1,
-                1,
-                block_dim=48,
-                src_ptr=host.data_ptr(),
-            )
+            result.zero_()
+            pool.copy_rows([host], [result], indices, rows, valid)
 
         enqueue()
         torch.npu.synchronize()
-        torch.testing.assert_close(result.cpu(), source.cpu(), rtol=0, atol=0)
+        check()
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
             enqueue()
@@ -77,7 +75,7 @@ def main():
             source.fill_(layer * 10 + replay)
             graph.replay()
             torch.npu.synchronize()
-            torch.testing.assert_close(result.cpu(), source.cpu(), rtol=0, atol=0)
+            check()
     print(
         f"PASS rank={group.rank_in_group}: MF write + AICore read, eager/graph, byte exact",
         flush=True,

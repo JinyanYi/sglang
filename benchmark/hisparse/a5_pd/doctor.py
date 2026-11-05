@@ -23,7 +23,7 @@ def inspect(role):
     )
     missing = [
         name
-        for name in ("OffloadConfig", "initialize", "empty", "sparse_copy")
+        for name in ("OffloadConfig", "initialize", "empty")
         if not hasattr(offload, name)
     ]
     if not hasattr(getattr(offload, "Scene", None), "SHARED"):
