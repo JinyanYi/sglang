@@ -15,7 +15,12 @@ def inspect(role):
     import torch  # noqa: F401  # Load libtorch before the MF extension.
     from memfabric_hybrid import TransferEngine, offload
 
-    protocol = os.environ.get("ASCEND_MF_TRANSFER_PROTOCOL", "device_sdma")
+    protocol = (
+        os.environ.get("ASCEND_MF_TRANSFER_PROTOCOL", "device_urma").strip().lower()
+    )
+    protocols = sorted(
+        name for name in dir(TransferEngine.TransDataOpType) if name.isupper()
+    )
     missing = [
         name
         for name in ("OffloadConfig", "initialize", "empty", "sparse_copy")
@@ -55,13 +60,14 @@ def inspect(role):
         packages=versions,
         memfabric_module=memfabric_hybrid.__file__,
         protocol=protocol,
+        available_protocols=protocols,
         missing_api=missing,
         installed_version_files=files,
         environment={
             key: os.environ.get(key)
             for key in (
                 "SGLANG_HOST_IP",
-                "ASCEND_MF_STORE_URL",
+                "MF_CONFIG_STORE_URL",
                 "MF_HYBM_USE_VMM_SEGMENT",
                 "ASCEND_RT_VISIBLE_DEVICES",
                 "SGLANG_NPU_A5_PD_MF",

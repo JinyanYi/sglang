@@ -302,6 +302,9 @@ def main():
     args.output_tokens = OUTPUT_TOKENS
 
     server_dir = args.root / f"decode-{args.mode}"
+    latest = args.root / f"decode-{args.mode}.latest"
+    if latest.is_file():
+        server_dir = args.root / latest.read_text(encoding="utf-8").strip()
     log_path = server_dir / "server.log"
     policy = (server_dir / "kv-policy.log").read_text(encoding="utf-8")
     expected_policy = (
@@ -328,6 +331,7 @@ def main():
     ]
     summary = dict(
         mode=args.mode,
+        decode_server_dir=str(server_dir),
         dp_per_role=DP,
         attention_tp=1,
         bs_per_dp=bs,

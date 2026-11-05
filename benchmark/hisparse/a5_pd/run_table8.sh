@@ -21,11 +21,25 @@ unset SGLANG_TEST_RETRACT SGLANG_TEST_RETRACT_INTERVAL
 export no_proxy="localhost,127.0.0.1,::1,$PREFILL_IP,$DECODE_IP${no_proxy:+,$no_proxy}"
 export NO_PROXY="$no_proxy"
 
+prepare_run_dir() {
+  local name="$1"
+  export RUN_DIR="$run_root/$name"
+  if [[ "${2:-}" == --dry-run ]]; then
+    return
+  fi
+  mkdir -p "$run_root"
+  RUN_DIR="$(mktemp -d "$run_root/$name-XXXXXX")"
+  if [[ "$name" == decode-* ]]; then
+    printf '%s\n' "${RUN_DIR##*/}" > "$RUN_DIR/latest"
+    mv -Tf "$RUN_DIR/latest" "$run_root/$name.latest"
+  fi
+  echo "run_dir=$RUN_DIR"
+}
+
 case "$role" in
   prefill)
     export PER_DP_BATCH_SIZE=16 GRAPH_BATCH_SIZE=16
-    export RUN_DIR="$run_root/prefill"
-    [[ "${1:-}" == --dry-run ]] || { mkdir -p "$run_root"; mkdir "$RUN_DIR"; }
+    prepare_run_dir prefill "${1:-}"
     exec bash "$here/launch.sh" prefill "$@"
     ;;
   router)
@@ -41,8 +55,7 @@ case "$role" in
     esac
     if [[ "$role" == decode ]]; then
       export PER_DP_BATCH_SIZE="$bs" GRAPH_BATCH_SIZE="$bs" KV_OFFLOAD="$offload"
-      export RUN_DIR="$run_root/decode-$mode"
-      [[ "${1:-}" == --dry-run ]] || { mkdir -p "$run_root"; mkdir "$RUN_DIR"; }
+      prepare_run_dir "decode-$mode" "${1:-}"
       exec bash "$here/launch.sh" decode "$@"
     fi
     source "$here/../a5_copysfa_mtp/common.sh"

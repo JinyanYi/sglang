@@ -63,10 +63,12 @@ matched A5 MF/HDK/firmware/LCNE/URMA/ubmem bundle from the machine provider befo
 upgrading anything. This branch neither upgrades drivers nor invents a minimum
 A5 version. A normal HCCL all-reduce or a successful import is insufficient.
 
-The default MF protocol `device_sdma` comes from the donor P/D recipe. Override
-`ASCEND_MF_TRANSFER_PROTOCOL` on both peers if the provider's A5 bundle requires
-another supported protocol. An unsupported enum or failed registration exits
-explicitly instead of silently selecting a different transport.
+The A5 launcher defaults to `device_urma`, the cross-host A5 protocol in the
+[MemFabric transfer example](https://github.com/Ascend/memfabric_hybrid/blob/9dc22e2a54fb8de28ba79ee77c714cded2086eb9/examples/transfer/test_transfer_pd_separate_hbm_dp.py).
+Override `ASCEND_MF_TRANSFER_PROTOCOL` on both peers if the provider's A5
+bundle specifies another protocol. The API check lists the installed enum
+names, and unsupported protocols fail before model startup. The launcher sets
+`MF_CONFIG_STORE_URL` for the shared configuration store.
 
 ## Pull the paired branches
 
@@ -233,8 +235,9 @@ and router, keep P running, and repeat with `decode hisparse`, `router` and
 (128 total requests) and C16000 with LIM, CopySFA and metadata fusion enabled.
 
 The launcher contains the deployment addresses and the shared result directory.
-Use a new `run_root` for a fresh pair of service launches. Each benchmark
-invocation uses a new subdirectory, with one common token-ID fixture for both
+Each service launch gets its own log directory. Stop the previous service for
+that role before relaunching. The benchmark follows `decode-<mode>.latest`
+and uses a new results subdirectory, with one common token-ID fixture for both
 cases. `bench native --input-ids /path/to/104k.json` can supply an existing
 104000-ID fixture for cross-framework comparison.
 
