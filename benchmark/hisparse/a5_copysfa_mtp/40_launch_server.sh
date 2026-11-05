@@ -81,6 +81,10 @@ case "${PD_ROLE:-null}" in
       args+=(--disaggregation-decode-extra-slots 0
         --disaggregation-decode-retraction-backup cpu_tensor)
       [[ "${PD_DECODE_RADIX:-1}" == 0 ]] || args+=(--disaggregation-decode-enable-radix-cache)
+      if [[ "${PD_BUFFERED_WEIGHT_LOAD:-0}" == 1 ]]; then
+        args+=(--weight-loader-disable-mmap
+          --model-loader-extra-config '{"enable_multithread_load":false}')
+      fi
     fi
     ;;
   *) echo "PD_ROLE must be null, prefill or decode" >&2; exit 2 ;;
