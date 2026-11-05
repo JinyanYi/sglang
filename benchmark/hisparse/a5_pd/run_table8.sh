@@ -55,6 +55,7 @@ case "$role" in
     esac
     if [[ "$role" == decode ]]; then
       export PER_DP_BATCH_SIZE="$bs" GRAPH_BATCH_SIZE="$bs" KV_OFFLOAD="$offload"
+      export MODEL_PATH="${PD_DECODE_MODEL_PATH:-$MODEL_PATH}"
       prepare_run_dir "decode-$mode" "${1:-}"
       exec bash "$here/launch.sh" decode "$@"
     fi
