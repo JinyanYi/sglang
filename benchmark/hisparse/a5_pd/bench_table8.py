@@ -67,6 +67,7 @@ def check_servers(args, out, bs):
             batch=batch,
             mtp=1,
             graph=role == "decode",
+            graph_batch=args.graph_batch_size if role == "decode" else None,
         )
         for key, value in {
             "model_path": args.model_path,
@@ -302,6 +303,7 @@ def main():
     parser.add_argument("--dp-size", type=int, choices=(1, 8), default=8)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--prefill-batch-size", type=int, default=16)
+    parser.add_argument("--graph-batch-size", type=int)
     parser.add_argument("--input-ids", type=Path)
     parser.add_argument("--warmup-rounds", type=int, default=2)
     parser.add_argument("--rounds", type=int, default=5)
@@ -317,6 +319,10 @@ def main():
     )
     if min(bs, args.prefill_batch_size) < 1:
         parser.error("batch sizes must be positive")
+    if args.graph_batch_size is None:
+        args.graph_batch_size = bs
+    if args.graph_batch_size < bs:
+        parser.error("graph batch size must cover the live batch")
     args.concurrency = bs * args.dp_size
     args.input_tokens = INPUT_TOKENS
     args.output_tokens = OUTPUT_TOKENS
@@ -355,6 +361,7 @@ def main():
         dp_per_role=args.dp_size,
         attention_tp=TP // args.dp_size,
         bs_per_dp=bs,
+        decode_graph_bucket=args.graph_batch_size,
         concurrency=args.concurrency,
         input_tokens=INPUT_TOKENS,
         output_tokens=OUTPUT_TOKENS,

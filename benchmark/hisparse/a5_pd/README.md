@@ -257,8 +257,9 @@ verbatim native result block from that log.
 ## Matched BS2 with attention DP disabled
 
 Insert `dp1` before each role in `run_table8.sh` to run attention TP8 and EP8
-on both nodes. Both decode cases use global BS2 and graph bucket 2, with the
-same 104000 input tokens, MTP3, cache checks and metrics as the DP8 run.
+on both nodes. Both decode cases use global BS2 and graph bucket 8. The bucket
+aligns single-token draft capture to attention TP8. The run retains the
+104000 input tokens, MTP3, cache checks and metrics of the DP8 run.
 The router registers one HTTP worker per role and uses the installed wheel.
 Restart both model services for this topology and keep the same P service
 when switching D from native to HiSparse. The results use the separate

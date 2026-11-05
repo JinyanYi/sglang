@@ -60,11 +60,13 @@ case "$role" in
       hisparse) bs=16; offload=1 ;;
       *) echo 'Choose native or hisparse' >&2; exit 2 ;;
     esac
+    graph_bs="$bs"
     if (( ATTN_DP_SIZE == 1 )); then
       bs=2
+      graph_bs="$TP_SIZE"
     fi
     if [[ "$role" == decode ]]; then
-      export PER_DP_BATCH_SIZE="$bs" GRAPH_BATCH_SIZE="$bs" KV_OFFLOAD="$offload"
+      export PER_DP_BATCH_SIZE="$bs" GRAPH_BATCH_SIZE="$graph_bs" KV_OFFLOAD="$offload"
       export MODEL_PATH="${PD_DECODE_MODEL_PATH:-$MODEL_PATH}"
       prepare_run_dir "decode-$mode" "${1:-}"
       exec bash "$here/launch.sh" decode "$@"
@@ -75,6 +77,7 @@ case "$role" in
     exec "$PYTHON_BIN" "$here/bench_table8.py" "$mode" \
       --root "$run_root" --model-path "$MODEL_PATH" \
       --dp-size "$ATTN_DP_SIZE" --batch-size "$bs" --prefill-batch-size "$prefill_bs" \
+      --graph-batch-size "$graph_bs" \
       --prefill-url "http://$PREFILL_IP:$PREFILL_PORT" \
       --decode-url "http://$DECODE_IP:$DECODE_PORT" \
       --base-url "http://127.0.0.1:$ROUTER_PORT" "$@"
