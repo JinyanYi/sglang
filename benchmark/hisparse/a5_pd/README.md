@@ -256,12 +256,14 @@ output throughput values. Every formal round preserves the original
 `bench-serving.stdout.log` and `bench-serving.jsonl`. The PNG renders the
 verbatim native result block from that log.
 
-## Matched BS5 with attention DP disabled
+## Native BS5 and HiSparse BS16 with attention DP disabled
 
 Insert `dp1` before each role in `run_table8.sh` to run attention TP8 and EP8
-on both nodes. Both decode cases use global BS5 and graph bucket 8. The bucket
-aligns single-token draft capture to attention TP8. The run retains the
-104000 input tokens, MTP3, cache checks and metrics of the DP8 run.
+on both nodes. Native uses global BS5 with graph bucket 8. HiSparse uses
+global BS16 with graph bucket 16. The buckets align single-token draft capture
+to attention TP8. Both cases use the same P service with an admission limit
+of 5 and retain the 104000 input tokens, MTP3, cache checks and metrics of the
+DP8 run.
 The router registers one HTTP worker per role and uses the installed wheel.
 Restart both model services for this topology and keep the same P service
 when switching D from native to HiSparse. The results use the separate

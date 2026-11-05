@@ -62,8 +62,7 @@ case "$role" in
     esac
     graph_bs="$bs"
     if (( ATTN_DP_SIZE == 1 )); then
-      bs="$prefill_bs"
-      graph_bs="$TP_SIZE"
+      graph_bs=$(( (bs + TP_SIZE - 1) / TP_SIZE * TP_SIZE ))
     fi
     if [[ "$role" == decode ]]; then
       export PER_DP_BATCH_SIZE="$bs" GRAPH_BATCH_SIZE="$graph_bs" KV_OFFLOAD="$offload"
