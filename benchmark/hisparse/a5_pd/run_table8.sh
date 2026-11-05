@@ -5,7 +5,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 role="${1:?Usage: run_table8.sh prefill|router|decode|bench [native|hisparse]}"
 shift
 run_root=/mnt/share/y00970600/a5-pd-runs/table8-20261105
-export PREFILL_IP=141.61.81.109 DECODE_IP=141.61.81.111
+export PREFILL_IP=141.61.81.109 DECODE_IP=141.61.81.110
 export PREFILL_PORT=30000 DECODE_PORT=30001 ROUTER_PORT=8000
 export PD_BOOTSTRAP_PORT=8998 MF_STORE_PORT=24669
 export FRAMEWORK_ROOT="$(cd "$here/../../.." && pwd)"
