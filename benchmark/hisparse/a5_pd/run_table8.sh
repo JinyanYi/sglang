@@ -9,7 +9,7 @@ if [[ "${1:-}" == dp1 ]]; then
   shift
   run_root="$run_root-dp1"
   export ATTN_DP_SIZE=1
-  prefill_bs=2
+  prefill_bs=5
 fi
 role="${1:?Usage: run_table8.sh [dp1] prefill|router|decode|bench [native|hisparse]}"
 shift
@@ -62,7 +62,7 @@ case "$role" in
     esac
     graph_bs="$bs"
     if (( ATTN_DP_SIZE == 1 )); then
-      bs=2
+      bs="$prefill_bs"
       graph_bs="$TP_SIZE"
     fi
     if [[ "$role" == decode ]]; then
