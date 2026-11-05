@@ -247,7 +247,9 @@ results require 103936 cached tokens on every request and full-batch graph
 samples from every D rank. P-side successful KV transfer counters are saved
 before and after each wave. The hot payload must match one tail page per request
 using the cold 813-page transfer as the calibration. The counters describe
-scheduled KV payload, not device-link wire bytes.
+scheduled KV payload, not device-link wire bytes. Each prefill attention-TP
+scheduler contributes one observation per completed request. The validation
+records both logical requests and raw observations.
 
 Read `summary.json` for the median of the five rounds' native TTFT, TPOT and
 output throughput values. Every formal round preserves the original

@@ -159,7 +159,8 @@ def transfer_snapshot(prefill_url, path, expected_count=None):
             path.write_bytes(raw)
             if expected_count is not None and totals[0] != expected_count:
                 raise ValueError(
-                    f"Expected transfer counter {expected_count}, got {totals[0]}; see {path}"
+                    f"Expected KV transfer observation counter {expected_count}, "
+                    f"got {totals[0]}; see {path}"
                 )
             return totals
         time.sleep(0.5)
@@ -192,7 +193,9 @@ def prime(args, out, ids):
     ):
         raise ValueError("Cold priming did not complete with empty P/D prefixes")
     after = transfer_snapshot(
-        args.prefill_url, out / "cold-metrics-after.txt", before[0] + args.dp_size
+        args.prefill_url,
+        out / "cold-metrics-after.txt",
+        before[0] + args.dp_size * args.attention_tp,
     )
     total_mib = after[1] - before[1]
     if not math.isfinite(total_mib) or total_mib <= 0:
@@ -247,8 +250,11 @@ def run_wave(args, out, ids, log_path, bs, mib_per_page, formal):
     errors = validate_result(
         result, args.concurrency, INPUT_TOKENS, OUTPUT_TOKENS, CACHE_TOKENS
     )
+    # Each P attention-TP scheduler observes the completed request.
     after = transfer_snapshot(
-        args.prefill_url, out / "metrics-after.txt", before[0] + args.concurrency
+        args.prefill_url,
+        out / "metrics-after.txt",
+        before[0] + args.concurrency * args.attention_tp,
     )
     transfer_mib = after[1] - before[1]
     expected_mib = mib_per_page * args.concurrency
@@ -279,7 +285,8 @@ def run_wave(args, out, ids, log_path, bs, mib_per_page, formal):
         valid=not errors,
         errors=errors,
         expected_cached_tokens=CACHE_TOKENS,
-        transfer_requests=after[0] - before[0],
+        transfer_requests=(after[0] - before[0]) // args.attention_tp,
+        transfer_observations=after[0] - before[0],
         transfer_mib=transfer_mib,
         expected_tail_transfer_mib=expected_mib,
         full_batch_graph_ranks=sorted(full_ranks),
@@ -324,6 +331,7 @@ def main():
     if args.graph_batch_size < bs:
         parser.error("graph batch size must cover the live batch")
     args.concurrency = bs * args.dp_size
+    args.attention_tp = TP // args.dp_size
     args.input_tokens = INPUT_TOKENS
     args.output_tokens = OUTPUT_TOKENS
 
@@ -359,7 +367,7 @@ def main():
         mode=args.mode,
         decode_server_dir=str(server_dir),
         dp_per_role=args.dp_size,
-        attention_tp=TP // args.dp_size,
+        attention_tp=args.attention_tp,
         bs_per_dp=bs,
         decode_graph_bucket=args.graph_batch_size,
         concurrency=args.concurrency,
