@@ -20,7 +20,8 @@ from bench_prefix_cache import run_native_benchmark, validate_result
 from check_server_state import validate as validate_server
 from shared_prefix_workload import post
 
-DP = 8
+TP = 8
+EP = 8
 INPUT_TOKENS = 104000
 OUTPUT_TOKENS = 1024
 PAGE_SIZE = 128
@@ -37,9 +38,9 @@ METRICS = (
     "output_throughput",
     "request_throughput",
 )
-DECODE_BATCH = re.compile(
-    r"\bDP(\d+)\b.*Decode batch(?: \[\d+\])?, #running-req: (\d+).*npu graph: True"
-)
+GRAPH_BATCH = r"Decode batch(?: \[\d+\])?, #running-req: (\d+).*npu graph: True"
+DECODE_BATCH = re.compile(r"\bDP(\d+)\b.*" + GRAPH_BATCH)
+SINGLE_DP_BATCH = re.compile(GRAPH_BATCH)
 
 
 def write_json(path, value):
@@ -53,13 +54,19 @@ def get(url):
 
 def check_servers(args, out, bs):
     for role, url, batch in (
-        ("prefill", args.prefill_url, 16),
+        ("prefill", args.prefill_url, args.prefill_batch_size),
         ("decode", args.decode_url, bs),
     ):
         info = json.loads(get(url + "/server_info"))
         write_json(out / f"{role}-server-info.json", info)
         errors = validate_server(
-            info, tp=DP, dp=DP, ep=DP, batch=batch, mtp=1, graph=role == "decode"
+            info,
+            tp=TP,
+            dp=args.dp_size,
+            ep=EP,
+            batch=batch,
+            mtp=1,
+            graph=role == "decode",
         )
         for key, value in {
             "model_path": args.model_path,
@@ -78,13 +85,15 @@ def check_servers(args, out, bs):
         (w["worker_type"], w["url"]) for w in workers["workers"] if w["is_healthy"]
     }
     expected = {
-        (role, f"{url}@{rank}")
+        (role, url if args.dp_size == 1 else f"{url}@{rank}")
         for role, url in (("prefill", args.prefill_url), ("decode", args.decode_url))
-        for rank in range(DP)
+        for rank in range(args.dp_size)
     }
     if actual != expected:
         raise ValueError(
-            "Router must expose 8 healthy DP ranks per role; see router-workers.json"
+            f"Router workers differ from the expected topology. "
+            f"Missing {sorted(expected - actual)}, unexpected {sorted(actual - expected)}. "
+            "See router-workers.json."
         )
 
 
@@ -166,10 +175,10 @@ def prime(args, out, ids):
         "sampling_params": {"temperature": 0, "max_new_tokens": 4, "ignore_eos": True},
     }
     # One round-robin request per D rank populates the local radix prefix.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=DP) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.dp_size) as executor:
         futures = [
             executor.submit(post, args.base_url + "/generate", body, 3600)
-            for _ in range(DP)
+            for _ in range(args.dp_size)
         ]
         results = [json.loads(future.result()) for future in futures]
     metadata = [result["meta_info"] for result in results]
@@ -182,12 +191,12 @@ def prime(args, out, ids):
     ):
         raise ValueError("Cold priming did not complete with empty P/D prefixes")
     after = transfer_snapshot(
-        args.prefill_url, out / "cold-metrics-after.txt", before[0] + DP
+        args.prefill_url, out / "cold-metrics-after.txt", before[0] + args.dp_size
     )
     total_mib = after[1] - before[1]
     if not math.isfinite(total_mib) or total_mib <= 0:
         raise ValueError("Cold priming did not record positive P/D KV payload")
-    return total_mib / (DP * COLD_PAGES)
+    return total_mib / (args.dp_size * COLD_PAGES)
 
 
 def capture_report(log, out):
@@ -255,9 +264,12 @@ def run_wave(args, out, ids, log_path, bs, mib_per_page, formal):
         for rank, batch in DECODE_BATCH.findall(decode_log)
         if int(batch) == bs
     }
-    if formal and full_ranks != set(range(DP)):
+    if args.dp_size == 1 and str(bs) in SINGLE_DP_BATCH.findall(decode_log):
+        full_ranks.add(0)
+    missing_ranks = set(range(args.dp_size)) - full_ranks
+    if formal and missing_ranks:
         errors.append(
-            f"Missing full BS{bs} NPU graph samples for DP ranks {sorted(set(range(DP)) - full_ranks)}"
+            f"Missing full BS{bs} NPU graph samples for DP ranks {sorted(missing_ranks)}"
         )
     values = {key: result[key] for key in METRICS}
     if any(not math.isfinite(value) or value <= 0 for value in values.values()):
@@ -287,6 +299,9 @@ def main():
     parser.add_argument("--prefill-url", required=True)
     parser.add_argument("--decode-url", required=True)
     parser.add_argument("--base-url", required=True)
+    parser.add_argument("--dp-size", type=int, choices=(1, 8), default=8)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--prefill-batch-size", type=int, default=16)
     parser.add_argument("--input-ids", type=Path)
     parser.add_argument("--warmup-rounds", type=int, default=2)
     parser.add_argument("--rounds", type=int, default=5)
@@ -295,9 +310,14 @@ def main():
         parser.error("warmup and measured rounds must both be positive")
     for name in ("prefill_url", "decode_url", "base_url"):
         setattr(args, name, getattr(args, name).rstrip("/"))
-    bs = 5 if args.mode == "native" else 16
-    args.concurrency = bs * DP
-    args.dp_size = DP
+    bs = (
+        args.batch_size
+        if args.batch_size is not None
+        else (5 if args.mode == "native" else 16)
+    )
+    if min(bs, args.prefill_batch_size) < 1:
+        parser.error("batch sizes must be positive")
+    args.concurrency = bs * args.dp_size
     args.input_tokens = INPUT_TOKENS
     args.output_tokens = OUTPUT_TOKENS
 
@@ -332,8 +352,8 @@ def main():
     summary = dict(
         mode=args.mode,
         decode_server_dir=str(server_dir),
-        dp_per_role=DP,
-        attention_tp=1,
+        dp_per_role=args.dp_size,
+        attention_tp=TP // args.dp_size,
         bs_per_dp=bs,
         concurrency=args.concurrency,
         input_tokens=INPUT_TOKENS,
