@@ -34,7 +34,7 @@ def validate_result(result, count, input_tokens, output_tokens, expected_cached)
     return errors
 
 
-def run_native_benchmark(args, token_ids, output):
+def run_native_benchmark(args, token_ids, output, *, route_dp=True):
     """Adapt only dataset/routing; preserve native timing, SSE parsing and metrics."""
     from sglang.benchmark import serving
 
@@ -49,7 +49,9 @@ def run_native_benchmark(args, token_ids, output):
                 prompt=token_ids,
                 prompt_len=len(token_ids),
                 output_len=args.output_tokens,
-                extra_request_body={"routed_dp_rank": index % args.dp_size},
+                extra_request_body=(
+                    {"routed_dp_rank": index % args.dp_size} if route_dp else {}
+                ),
             )
             for index in range(args.concurrency)
         ]

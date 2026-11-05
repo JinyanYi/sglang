@@ -217,3 +217,36 @@ Do not report `smoke.py` as bench_serving throughput. P/D timing includes
 transport and P compute and has different routing/priming from the old colocated
 `50_perf.sh`. Establish accuracy/cache and real per-DP admission first; retain
 the old colocated BS7/BS16 performance results as a separate configuration.
+
+## Table 8 settings on two 8-device P/D hosts
+
+`run_table8.sh` uses GLM-5.2 W4A4C8, MTP3, 104000 input tokens, 1024 output
+tokens, and the same P configuration for both cases. Each role uses DP8,
+attention TP1 and EP8. The article uses 16 decode ranks and derives TPOT and
+throughput from ITL. This run uses 8 decode ranks and records client metrics.
+
+Run `run_table8.sh prefill` on P, then `run_table8.sh decode native` and
+`run_table8.sh router` in separate terminals on D. Once both workers and the
+router are ready, run `run_table8.sh bench native` on D. Stop that D service
+and router, keep P running, and repeat with `decode hisparse`, `router` and
+`bench hisparse`. Native uses BS5 (40 total requests). HiSparse uses BS16
+(128 total requests) and C16000 with LIM, CopySFA and metadata fusion enabled.
+
+The launcher contains the deployment addresses and the shared result directory.
+Use a new `run_root` for a fresh pair of service launches. Each benchmark
+invocation uses a new subdirectory, with one common token-ID fixture for both
+cases. `bench native --input-ids /path/to/104k.json` can supply an existing
+104000-ID fixture for cross-framework comparison.
+
+Each case flushes both roles once, primes each D rank, runs two full warmup
+waves, then records five single-wave native `bench_serving` runs. Formal
+results require 103936 cached tokens on every request and full-batch graph
+samples from every D rank. P-side successful KV transfer counters are saved
+before and after each wave. The hot payload must match one tail page per request
+using the cold 813-page transfer as the calibration. The counters describe
+scheduled KV payload, not device-link wire bytes.
+
+Read `summary.json` for the median of the five rounds' native TTFT, TPOT and
+output throughput values. Every formal round preserves the original
+`bench-serving.stdout.log` and `bench-serving.jsonl`. The PNG renders the
+verbatim native result block from that log.
