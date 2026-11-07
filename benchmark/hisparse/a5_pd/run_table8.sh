@@ -52,7 +52,7 @@ case "$role" in
     shift
     case "$mode" in
       native) bs=5; offload=0 ;;
-      hisparse) bs=16; offload=1 ;;
+      hisparse) bs=16; offload=1; export MEM_FRACTION_STATIC=0.94 ;;
       *) echo 'Choose native or hisparse' >&2; exit 2 ;;
     esac
     graph_bs="$bs"

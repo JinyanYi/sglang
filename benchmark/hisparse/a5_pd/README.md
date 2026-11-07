@@ -236,6 +236,9 @@ keep P and router running, and repeat with `decode hisparse` and
 `SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=0`. Native uses BS5
 (40 total requests). HiSparse uses BS16
 (128 total requests) and C16000 with LIM, CopySFA and metadata fusion enabled.
+Prefill and native Decode use memory fraction 0.86; HiSparse Decode uses 0.94
+to cover its fixed C16000 manager reservation before sizing indexer/draft KV.
+The remaining graph/runtime headroom still requires validation on the device.
 
 The launcher contains the deployment addresses and the shared result directory.
 Each service launch gets its own log directory. Stop the previous service for
