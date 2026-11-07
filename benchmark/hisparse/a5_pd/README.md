@@ -246,15 +246,13 @@ cases. `bench native --input-ids /path/to/104k.json` can supply an existing
 
 Each case flushes both roles once and calibrates transfer size using one cold
 request. It runs at least two warmup waves, adding up to six more until every
-request hits the expected prefix and the transfer payload matches one tail
-page per request, then records five single-wave native `bench_serving` runs. Formal
-results require 103936 cached tokens on every request and full-batch graph
-samples from every D rank. P-side successful KV transfer counters are saved
-before and after each wave. The hot payload must match one tail page per request
-using the cold 813-page transfer as the calibration. The counters describe
-scheduled KV payload, not device-link wire bytes. Each prefill attention-TP
-scheduler contributes one observation per completed request. The validation
-records both logical requests and raw observations.
+request hits the expected prefix, then records five single-wave native
+`bench_serving` runs. Formal results require successful completions with
+103936 cached tokens on every request. Transfer telemetry and per-rank graph
+samples are saved as diagnostics, without waiting for a specific observation
+count or rejecting a run on that basis. Transfer observations are not request
+completion counters or device-link wire bytes. Missing full-batch graph samples
+are reported so the reader can assess actual per-rank batch coverage.
 
 Read `summary.json` for the median of the five rounds' native TTFT, TPOT and
 output throughput values. Every formal round preserves the original
