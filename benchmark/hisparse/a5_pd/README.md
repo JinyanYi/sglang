@@ -229,9 +229,10 @@ throughput from ITL. This run uses 8 decode ranks and records client metrics.
 
 Run `run_table8.sh prefill` on P, then `run_table8.sh decode native` and
 `run_table8.sh router` in separate terminals on D. Once both workers and the
-router are ready, run `run_table8.sh bench native` on D. Stop that D service
-and router, keep P running, and repeat with `decode hisparse`, `router` and
-`bench hisparse`. Native uses BS5 (40 total requests). HiSparse uses BS16
+router are ready, run `run_table8.sh bench native` on D. Stop that D service,
+keep P and router running, and repeat with `decode hisparse` and
+`bench hisparse`. The router uses `/tmp/a5-smg-venv/bin/smg`. Native uses BS5
+(40 total requests). HiSparse uses BS16
 (128 total requests) and C16000 with LIM, CopySFA and metadata fusion enabled.
 
 The launcher contains the deployment addresses and the shared result directory.
@@ -255,19 +256,6 @@ Read `summary.json` for the median of the five rounds' native TTFT, TPOT and
 output throughput values. Every formal round preserves the original
 `bench-serving.stdout.log` and `bench-serving.jsonl`. The PNG renders the
 verbatim native result block from that log.
-
-## Native BS5 and HiSparse BS16 with attention DP disabled
-
-Insert `dp1` before each role in `run_table8.sh` to run attention TP8 and EP8
-on both nodes. Native uses global BS5 with graph bucket 8. HiSparse uses
-global BS16 with graph bucket 16. The buckets align single-token draft capture
-to attention TP8. Both cases use the same P service with an admission limit
-of 5 and retain the 104000 input tokens, MTP3, cache checks and metrics of the
-DP8 run.
-The router registers one HTTP worker per role and uses the installed wheel.
-Restart both model services for this topology and keep the same P service
-when switching D from native to HiSparse. The results use the separate
-`table8-20261105-dp1` directory.
 
 ## Inspect the installed router before rebuilding
 

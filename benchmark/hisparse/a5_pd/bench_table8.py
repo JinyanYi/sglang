@@ -40,7 +40,6 @@ METRICS = (
 )
 GRAPH_BATCH = r"Decode batch(?: \[\d+\])?, #running-req: (\d+).*npu graph: True"
 DECODE_BATCH = re.compile(r"\bDP(\d+)\b.*" + GRAPH_BATCH)
-SINGLE_DP_BATCH = re.compile(GRAPH_BATCH)
 
 
 def write_json(path, value):
@@ -86,7 +85,7 @@ def check_servers(args, out, bs):
         (w["worker_type"], w["url"]) for w in workers["workers"] if w["is_healthy"]
     }
     expected = {
-        (role, url if args.dp_size == 1 else f"{url}@{rank}")
+        (role, f"{url}@{rank}")
         for role, url in (("prefill", args.prefill_url), ("decode", args.decode_url))
         for rank in range(args.dp_size)
     }
@@ -271,8 +270,6 @@ def run_wave(args, out, ids, log_path, bs, mib_per_page, formal):
         for rank, batch in DECODE_BATCH.findall(decode_log)
         if int(batch) == bs
     }
-    if args.dp_size == 1 and str(bs) in SINGLE_DP_BATCH.findall(decode_log):
-        full_ranks.add(0)
     missing_ranks = set(range(args.dp_size)) - full_ranks
     if formal and missing_ranks:
         errors.append(
@@ -307,7 +304,7 @@ def main():
     parser.add_argument("--prefill-url", required=True)
     parser.add_argument("--decode-url", required=True)
     parser.add_argument("--base-url", required=True)
-    parser.add_argument("--dp-size", type=int, choices=(1, 8), default=8)
+    parser.add_argument("--dp-size", type=int, choices=(8,), default=8)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--prefill-batch-size", type=int, default=16)
     parser.add_argument("--graph-batch-size", type=int)

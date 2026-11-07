@@ -5,13 +5,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 run_root=/mnt/share/y00970600/a5-pd-runs/table8-20261105
 export TP_SIZE=8 ATTN_DP_SIZE=8 EP_SIZE=8
 prefill_bs=16
-if [[ "${1:-}" == dp1 ]]; then
-  shift
-  run_root="$run_root-dp1"
-  export ATTN_DP_SIZE=1
-  prefill_bs=5
-fi
-role="${1:?Usage: run_table8.sh [dp1] prefill|router|decode|bench [native|hisparse]}"
+role="${1:?Usage: run_table8.sh prefill|router|decode|bench [native|hisparse]}"
 shift
 export PREFILL_IP=141.61.81.109 DECODE_IP=141.61.81.110
 export PREFILL_PORT=30000 DECODE_PORT=30001 ROUTER_PORT=8000
@@ -50,7 +44,7 @@ case "$role" in
     exec bash "$here/launch.sh" prefill "$@"
     ;;
   router)
-    exec bash "$here/router.sh" --policy round_robin --disable-retries "$@"
+    exec bash "$here/router.sh" --policy round_robin "$@"
     ;;
   decode|bench)
     mode="${1:?Choose native or hisparse}"
@@ -61,9 +55,6 @@ case "$role" in
       *) echo 'Choose native or hisparse' >&2; exit 2 ;;
     esac
     graph_bs="$bs"
-    if (( ATTN_DP_SIZE == 1 )); then
-      graph_bs=$(( (bs + TP_SIZE - 1) / TP_SIZE * TP_SIZE ))
-    fi
     if [[ "$role" == decode ]]; then
       export PER_DP_BATCH_SIZE="$bs" GRAPH_BATCH_SIZE="$graph_bs" KV_OFFLOAD="$offload"
       export MODEL_PATH="${PD_DECODE_MODEL_PATH:-$MODEL_PATH}"
@@ -81,5 +72,5 @@ case "$role" in
       --decode-url "http://$DECODE_IP:$DECODE_PORT" \
       --base-url "http://127.0.0.1:$ROUTER_PORT" "$@"
     ;;
-  *) echo 'Usage: run_table8.sh [dp1] prefill|router|decode|bench [native|hisparse]' >&2; exit 2 ;;
+  *) echo 'Usage: run_table8.sh prefill|router|decode|bench [native|hisparse]' >&2; exit 2 ;;
 esac
