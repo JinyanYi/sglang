@@ -268,3 +268,19 @@ The router registers one HTTP worker per role and uses the installed wheel.
 Restart both model services for this topology and keep the same P service
 when switching D from native to HiSparse. The results use the separate
 `table8-20261105-dp1` directory.
+
+## Inspect the installed router before rebuilding
+
+Run `python3 benchmark/hisparse/a5_pd/diagnose_router_wheel.py` in the original
+router container. It records the Python executable, actual imported native
+module, binary SHA256 and available native build version. Three temporary
+loopback P/D pairs exercise DP1, legacy DP8 and attention DP8 metadata against
+the installed wheel. They serve HTTP fixtures and require no NPU or model.
+The diagnostic shuts down only the router processes it starts. Each case
+preserves its launch command, router log, metadata and `/workers` response.
+
+`attention_dp_discovery_mismatch` (exit 2) requires both control cases to pass
+and attention DP8 to register only one healthy worker per role. Exit 0 means
+all three metadata cases register the expected ranks. Other outcomes are
+inconclusive (exit 1) and require examining the case logs. This tests rank
+discovery, and full P/D routing still requires a model-level request check.
