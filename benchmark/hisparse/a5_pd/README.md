@@ -284,3 +284,12 @@ and attention DP8 to register only one healthy worker per role. Exit 0 means
 all three metadata cases register the expected ranks. Other outcomes are
 inconclusive (exit 1) and require examining the case logs. This tests rank
 discovery, and full P/D routing still requires a model-level request check.
+
+After confirming a discovery mismatch, run
+`bash benchmark/hisparse/a5_pd/build_router_wheel.sh` on the original aarch64
+Linux host. The script stages the current commit in a local temporary
+directory, installs missing compiler prerequisites using the available package
+manager when run as root, and builds only the router wheel. The shared wheel
+directory contains the source commit, build log, glibc version and SHA256.
+Install the wheel into the router container and repeat the diagnostic there.
+Check the wheel's glibc requirements against that container before deployment.
