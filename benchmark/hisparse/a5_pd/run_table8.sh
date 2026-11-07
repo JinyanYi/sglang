@@ -17,6 +17,7 @@ export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export CONTEXT_LENGTH=106496 CHUNKED_PREFILL_SIZE=4096 SPARSE_CACHE_SIZE=16000
 export MAX_TOTAL_TOKENS=262144 MEM_FRACTION_STATIC=0.86
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
+export SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=0
 export PD_DECODE_RADIX=1
 unset SGLANG_TEST_RETRACT SGLANG_TEST_RETRACT_INTERVAL
 export no_proxy="localhost,127.0.0.1,::1,$PREFILL_IP,$DECODE_IP${no_proxy:+,$no_proxy}"
@@ -44,7 +45,7 @@ case "$role" in
     exec bash "$here/launch.sh" prefill "$@"
     ;;
   router)
-    exec bash "$here/router.sh" --policy round_robin "$@"
+    exec bash "$here/router.sh" --policy round_robin --disable-retries "$@"
     ;;
   decode|bench)
     mode="${1:?Choose native or hisparse}"

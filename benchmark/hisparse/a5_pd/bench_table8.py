@@ -1,7 +1,6 @@
 """Measure the two A5 P/D cases using the native SGLang serving benchmark."""
 
 import argparse
-import concurrent.futures
 import contextlib
 import hashlib
 import json
@@ -85,9 +84,8 @@ def check_servers(args, out, bs):
         (w["worker_type"], w["url"]) for w in workers["workers"] if w["is_healthy"]
     }
     expected = {
-        (role, f"{url}@{rank}")
+        (role, url)
         for role, url in (("prefill", args.prefill_url), ("decode", args.decode_url))
-        for rank in range(args.dp_size)
     }
     if actual != expected:
         raise ValueError(
@@ -175,14 +173,10 @@ def prime(args, out, ids):
         "stream": False,
         "sampling_params": {"temperature": 0, "max_new_tokens": 4, "ignore_eos": True},
     }
-    # One round-robin request per D rank populates the local radix prefix.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.dp_size) as executor:
-        futures = [
-            executor.submit(post, args.base_url + "/generate", body, 3600)
-            for _ in range(args.dp_size)
-        ]
-        results = [json.loads(future.result()) for future in futures]
-    metadata = [result["meta_info"] for result in results]
+    # A single cold request calibrates the transfer without assuming that
+    # random bootstrap rooms cover each prefill rank exactly once.
+    result = json.loads(post(args.base_url + "/generate", body, 3600))
+    metadata = [result["meta_info"]]
     write_json(out / "cold-prime.json", metadata)
     if any(
         m.get("prompt_tokens") != INPUT_TOKENS
@@ -194,12 +188,12 @@ def prime(args, out, ids):
     after = transfer_snapshot(
         args.prefill_url,
         out / "cold-metrics-after.txt",
-        before[0] + args.dp_size * args.attention_tp,
+        before[0] + args.attention_tp,
     )
     total_mib = after[1] - before[1]
     if not math.isfinite(total_mib) or total_mib <= 0:
         raise ValueError("Cold priming did not record positive P/D KV payload")
-    return total_mib / (args.dp_size * COLD_PAGES)
+    return total_mib / COLD_PAGES
 
 
 def capture_report(log, out):
@@ -291,7 +285,7 @@ def run_wave(args, out, ids, log_path, bs, mib_per_page, formal):
         accept_length=result.get("accept_length"),
     )
     write_json(out / "validation.json", report)
-    if errors:
+    if errors and (formal or result.get("completed") != args.concurrency):
         raise RuntimeError(f"{out}: " + "; ".join(errors))
     return report
 
@@ -352,10 +346,16 @@ def main():
     check_servers(args, out, bs)
     ids = load_fixture(args)
     mib_per_page = prime(args, out, ids)
-    for index in range(1, args.warmup_rounds + 1):
-        run_wave(
+    warm_ready = False
+    for index in range(1, args.warmup_rounds + 7):
+        warm = run_wave(
             args, out / f"warmup-{index:02}", ids, log_path, bs, mib_per_page, False
         )
+        if index >= args.warmup_rounds and warm["valid"]:
+            warm_ready = True
+            break
+    if not warm_ready:
+        raise RuntimeError("Warmup did not reach full cache and tail-transfer coverage")
     rounds = [
         run_wave(args, out / f"round-{index:02}", ids, log_path, bs, mib_per_page, True)
         for index in range(1, args.rounds + 1)

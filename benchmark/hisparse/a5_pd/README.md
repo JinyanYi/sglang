@@ -231,7 +231,9 @@ Run `run_table8.sh prefill` on P, then `run_table8.sh decode native` and
 `run_table8.sh router` in separate terminals on D. Once both workers and the
 router are ready, run `run_table8.sh bench native` on D. Stop that D service,
 keep P and router running, and repeat with `decode hisparse` and
-`bench hisparse`. The router uses `/tmp/a5-smg-venv/bin/smg`. Native uses BS5
+`bench hisparse`. The router uses the installed `sglang_router` without
+`--dp-aware`; each engine retains attention DP8. The launcher sets
+`SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=0`. Native uses BS5
 (40 total requests). HiSparse uses BS16
 (128 total requests) and C16000 with LIM, CopySFA and metadata fusion enabled.
 
@@ -242,8 +244,10 @@ and uses a new results subdirectory, with one common token-ID fixture for both
 cases. `bench native --input-ids /path/to/104k.json` can supply an existing
 104000-ID fixture for cross-framework comparison.
 
-Each case flushes both roles once, primes each D rank, runs two full warmup
-waves, then records five single-wave native `bench_serving` runs. Formal
+Each case flushes both roles once and calibrates transfer size using one cold
+request. It runs at least two warmup waves, adding up to six more until every
+request hits the expected prefix and the transfer payload matches one tail
+page per request, then records five single-wave native `bench_serving` runs. Formal
 results require 103936 cached tokens on every request and full-batch graph
 samples from every D rank. P-side successful KV transfer counters are saved
 before and after each wave. The hot payload must match one tail page per request
