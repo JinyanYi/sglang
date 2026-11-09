@@ -224,8 +224,9 @@ the old colocated BS7/BS16 performance results as a separate configuration.
 
 `run_table8.sh` uses GLM-5.2 W4A4C8, MTP3, 104000 input tokens, 1024 output
 tokens, and the same P configuration for both cases. Each role uses DP8,
-attention TP1 and EP8. The article uses 16 decode ranks and derives TPOT and
-throughput from ITL. This run uses 8 decode ranks and records client metrics.
+attention TP1 and EP8. The article uses a colocated DP16/EP16 deployment and
+derives TPOT and throughput from ITL. This P/D run uses 8 ranks per role and
+records client metrics; its per-device weight budget differs from the article.
 
 Run `run_table8.sh prefill` on P, then `run_table8.sh decode native` and
 `run_table8.sh router` in separate terminals on D. Once both workers and the
@@ -234,8 +235,13 @@ keep P and router running, and repeat with `decode hisparse` and
 `bench hisparse`. The router uses the installed `sglang_router` without
 `--dp-aware`; each engine retains attention DP8. The launcher sets
 `SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=0`. Native uses BS5
-(40 total requests). HiSparse uses BS16
-(128 total requests) and C16000 with LIM, CopySFA and metadata fusion enabled.
+(40 total requests). HiSparse defaults to BS12
+(96 total requests) and C16000 with LIM, CopySFA and metadata fusion enabled.
+Use `decode hisparse --batch-size 14` and `bench hisparse --batch-size 14`
+to select BS14 (112 total requests). The same parameter is available for native;
+it sets the per-DP admission limit, graph bucket and benchmark wave size together.
+Restart Decode when changing its batch size, and pass the same size to the bench.
+These defaults are test points, not measured capacity limits.
 Prefill and native Decode use memory fraction 0.86; HiSparse Decode uses 0.94
 to cover its fixed C16000 manager reservation before sizing indexer/draft KV.
 The remaining graph/runtime headroom still requires validation on the device.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A5 P/D comparison: native BS5 vs fused sparse offload BS16.
+# A5 P/D comparison: native BS5 vs configurable fused sparse offload (BS12).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 run_root=/mnt/share/y00970600/a5-pd-runs/table8-20261105
@@ -52,9 +52,22 @@ case "$role" in
     shift
     case "$mode" in
       native) bs=5; offload=0 ;;
-      hisparse) bs=16; offload=1; export MEM_FRACTION_STATIC=0.94 ;;
+      hisparse) bs=12; offload=1; export MEM_FRACTION_STATIC=0.94 ;;
       *) echo 'Choose native or hisparse' >&2; exit 2 ;;
     esac
+    forward_args=()
+    while (( $# )); do
+      case "$1" in
+        --batch-size)
+          [[ $# -ge 2 ]] || { echo '--batch-size requires a positive integer' >&2; exit 2; }
+          bs="$2"
+          shift 2
+          ;;
+        *) forward_args+=("$1"); shift ;;
+      esac
+    done
+    set -- "${forward_args[@]}"
+    [[ "$bs" =~ ^[1-9][0-9]*$ ]] || { echo '--batch-size must be positive' >&2; exit 2; }
     graph_bs="$bs"
     if [[ "$role" == decode ]]; then
       export PER_DP_BATCH_SIZE="$bs" GRAPH_BATCH_SIZE="$graph_bs" KV_OFFLOAD="$offload"

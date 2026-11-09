@@ -215,7 +215,9 @@ def capture_report(log, out):
 
 def run_wave(args, out, ids, log_path, bs, mib_per_page, formal):
     out.mkdir()
-    print(f"WAVE_START {out.name} requests={args.concurrency} formal={formal}", flush=True)
+    print(
+        f"WAVE_START {out.name} requests={args.concurrency} formal={formal}", flush=True
+    )
     before = transfer_snapshot(args.prefill_url, out / "metrics-before.txt")
     log_offset = log_path.stat().st_size
     raw = out / "bench-serving.jsonl"
@@ -240,18 +242,12 @@ def run_wave(args, out, ids, log_path, bs, mib_per_page, formal):
         out / "metrics-after.txt",
     )
     transfer_mib = (
-        after[1] - before[1]
-        if before[1] is not None and after[1] is not None
-        else None
+        after[1] - before[1] if before[1] is not None and after[1] is not None else None
     )
     observations = (
-        after[0] - before[0]
-        if before[0] is not None and after[0] is not None
-        else None
+        after[0] - before[0] if before[0] is not None and after[0] is not None else None
     )
-    expected_mib = (
-        mib_per_page * args.concurrency if mib_per_page is not None else None
-    )
+    expected_mib = mib_per_page * args.concurrency if mib_per_page is not None else None
     with log_path.open("rb") as log:
         log.seek(log_offset)
         decode_log = log.read().decode(errors="replace")
@@ -278,7 +274,9 @@ def run_wave(args, out, ids, log_path, bs, mib_per_page, formal):
         accept_length=result.get("accept_length"),
     )
     write_json(out / "validation.json", report)
-    print(f"WAVE_DONE {out.name} cache_and_requests_valid={report['valid']}", flush=True)
+    print(
+        f"WAVE_DONE {out.name} cache_and_requests_valid={report['valid']}", flush=True
+    )
     if errors and (formal or result.get("completed") != args.concurrency):
         raise RuntimeError(f"{out}: " + "; ".join(errors))
     return report
@@ -307,7 +305,7 @@ def main():
     bs = (
         args.batch_size
         if args.batch_size is not None
-        else (5 if args.mode == "native" else 16)
+        else (5 if args.mode == "native" else 12)
     )
     if min(bs, args.prefill_batch_size) < 1:
         parser.error("batch sizes must be positive")
