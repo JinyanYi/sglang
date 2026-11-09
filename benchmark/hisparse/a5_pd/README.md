@@ -254,7 +254,7 @@ cases. `bench native --input-ids /path/to/104k.json` can supply an existing
 104000-ID fixture for cross-framework comparison.
 
 Each case flushes both roles once and calibrates transfer size using one cold
-request. It runs at least two warmup waves, adding up to six more until every
+request. It runs at least eight warmup waves, adding up to six more until every
 request hits the expected prefix, then records five single-wave native
 `bench_serving` runs. Formal results require successful completions with
 103936 cached tokens on every request. Transfer telemetry and per-rank graph

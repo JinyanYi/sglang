@@ -295,7 +295,7 @@ def main():
     parser.add_argument("--prefill-batch-size", type=int, default=16)
     parser.add_argument("--graph-batch-size", type=int)
     parser.add_argument("--input-ids", type=Path)
-    parser.add_argument("--warmup-rounds", type=int, default=2)
+    parser.add_argument("--warmup-rounds", type=int, default=8)
     parser.add_argument("--rounds", type=int, default=5)
     args = parser.parse_args()
     if args.warmup_rounds < 1 or args.rounds < 1:
