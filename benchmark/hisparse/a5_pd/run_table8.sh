@@ -7,7 +7,7 @@ export TP_SIZE=8 ATTN_DP_SIZE=8 EP_SIZE=8
 prefill_bs=16
 role="${1:?Usage: run_table8.sh prefill|router|decode|bench [native|hisparse]}"
 shift
-export PREFILL_IP=141.61.81.109 DECODE_IP=141.61.81.110
+export PREFILL_IP=141.61.45.105 DECODE_IP=141.61.45.113
 export PREFILL_PORT=30000 DECODE_PORT=30001 ROUTER_PORT=8000
 export PD_BOOTSTRAP_PORT=8998 MF_STORE_PORT=24669
 export FRAMEWORK_ROOT="$(cd "$here/../../.." && pwd)"
