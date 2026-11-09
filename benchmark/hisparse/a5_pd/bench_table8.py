@@ -24,7 +24,6 @@ INPUT_TOKENS = 104000
 OUTPUT_TOKENS = 1024
 PAGE_SIZE = 128
 CACHE_TOKENS = (INPUT_TOKENS - 1) // PAGE_SIZE * PAGE_SIZE
-COLD_PAGES = math.ceil(INPUT_TOKENS / PAGE_SIZE)
 TRANSFER_METRIC = "sglang:kv_transfer_total_mb"
 METRICS = (
     "mean_ttft_ms",
@@ -156,35 +155,24 @@ def transfer_snapshot(prefill_url, path):
 
 
 def prime(args, out, ids):
-    for role, url in (("prefill", args.prefill_url), ("decode", args.decode_url)):
-        response = post(url + "/flush_cache?timeout=60", {}, timeout=65)
-        (out / f"{role}-flush.txt").write_bytes(response)
-    before = transfer_snapshot(args.prefill_url, out / "cold-metrics-before.txt")
+    # Preserve existing P/D caches. This request may be cold or warm.
+    transfer_snapshot(args.prefill_url, out / "prime-metrics-before.txt")
     body = {
         "input_ids": ids,
         "stream": False,
         "sampling_params": {"temperature": 0, "max_new_tokens": 4, "ignore_eos": True},
     }
-    # A single cold request calibrates the transfer without assuming that
-    # random bootstrap rooms cover each prefill rank exactly once.
     result = json.loads(post(args.base_url + "/generate", body, 3600))
     metadata = [result["meta_info"]]
-    write_json(out / "cold-prime.json", metadata)
+    write_json(out / "prime.json", metadata)
     if any(
-        m.get("prompt_tokens") != INPUT_TOKENS
-        or m.get("completion_tokens") != 4
-        or m.get("cached_tokens") != 0
+        m.get("prompt_tokens") != INPUT_TOKENS or m.get("completion_tokens") != 4
         for m in metadata
     ):
-        raise ValueError("Cold priming did not complete with empty P/D prefixes")
-    after = transfer_snapshot(
-        args.prefill_url,
-        out / "cold-metrics-after.txt",
-    )
-    if before[1] is None or after[1] is None:
-        return None
-    total_mib = after[1] - before[1]
-    return total_mib / COLD_PAGES if total_mib > 0 else None
+        raise ValueError("Priming request did not complete with the expected lengths")
+    transfer_snapshot(args.prefill_url, out / "prime-metrics-after.txt")
+    # The cache state and transferred pages are unknown; do not calibrate from it.
+    return None
 
 
 def capture_report(log, out):
@@ -365,8 +353,7 @@ def main():
         fixture_sha256=hashlib.sha256(
             (args.root / "input_ids.json").read_bytes()
         ).hexdigest(),
-        cold_pages_per_request=COLD_PAGES,
-        cold_transfer_mib_per_page=mib_per_page,
+        transfer_mib_per_page=mib_per_page,
         expected_hot_pages_per_request=1,
         rounds=rounds,
         median_of_round_metrics={
