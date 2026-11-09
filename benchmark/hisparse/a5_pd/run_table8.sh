@@ -40,6 +40,7 @@ prepare_run_dir() {
 
 case "$role" in
   prefill)
+    export HCCL_BUFFSIZE=1024
     export PER_DP_BATCH_SIZE="$prefill_bs" GRAPH_BATCH_SIZE="$prefill_bs"
     prepare_run_dir prefill "${1:-}"
     exec bash "$here/launch.sh" prefill "$@"
