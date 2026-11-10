@@ -72,6 +72,7 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
     is_deepseek_v4,
+    is_glm_moe_dsa,
     is_minimax_sparse,
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
@@ -755,10 +756,8 @@ class Scheduler(
             self.rust_server.set_startup_time(self.startup_time)
 
     def maybe_init_hccl_dp_prewarm(self) -> None:
-        if not (
-            _is_npu
-            and is_deepseek_v4(self.tp_worker.model_runner.model_config.hf_config)
-        ):
+        hf_config = self.tp_worker.model_runner.model_config.hf_config
+        if not (_is_npu and (is_deepseek_v4(hf_config) or is_glm_moe_dsa(hf_config))):
             return
 
         parallel = get_parallel()
@@ -766,6 +765,7 @@ class Scheduler(
         rank = (
             parallel.dp_rank if parallel.dp_rank is not None else tp_group.rank_in_group
         )
+        torch.distributed.barrier(group=tp_group.cpu_group)
         logger.info("HCCL DP prewarm start: rank=%s", rank)
         _prewarm_hccl_group(
             device=tp_group.device,
