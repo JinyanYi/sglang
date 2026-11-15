@@ -104,3 +104,22 @@ def prepare_sparse_kv_publication(*args, **kwargs):
 
 
 __all__.append("prepare_sparse_kv_publication")
+
+register_kernel(
+    KernelSpec(
+        op="kvcache.prepare_sparse_kv_publication_rows",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.kvcache.npu_sparse_kv:prepare_sparse_kv_publication_rows",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+
+
+def prepare_sparse_kv_publication_rows(*args, **kwargs):
+    """Prepare sparse KV metadata without preparing or copying a payload."""
+    return get_kernel(
+        "kvcache.prepare_sparse_kv_publication_rows", KernelBackend.TRITON
+    )(*args, **kwargs)
+
+
+__all__.append("prepare_sparse_kv_publication_rows")

@@ -573,6 +573,139 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertEqual(cfg._fixed_overhead_bytes, 0)
         self.assertIsNone(mr.sparse_kv_budget_plan)
 
+    def test_a5_c8_prices_scales_for_each_physical_indexer_layer(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        mr = _make_model_runner(
+            self,
+            num_layers=4,
+            use_mla_backend=True,
+            page_size=128,
+            max_running_requests=2,
+        )
+        _configure_dsa_model(mr)
+        mr.model_config.hf_config.indexer_types = [
+            "full",
+            "shared",
+            "full",
+            "shared",
+        ]
+        mr.kv_cache_dtype = torch.float8_e4m3fn
+
+        with (
+            get_context().override_server_args(
+                attention_backend="ascend",
+                max_running_requests=2,
+                page_size=128,
+            ),
+            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+            envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
+            envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(8192),
+            envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
+            mock_cpu_env(kv_size=1),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
+                return_value=True,
+            ),
+            patch("sglang.srt.model_executor.pool_configurator._is_npu", True),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_sparsity_driven_kv_offload_enabled",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator._should_elide_dsa_index_k",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.cp.utils.get_glm_dsa_layer_split_effective_num_layers",
+                side_effect=lambda kvc, count: count,
+            ),
+        ):
+            cfg = DefaultPoolConfigurator(mr)
+
+        scale_layers = len(mr.get_dsa_indexer_layer_ids())
+        self.assertEqual(scale_layers, 2)
+        self.assertEqual(cfg._cell_size, scale_layers * (128 + 4))
+        self.assertEqual(
+            cfg._fixed_overhead_bytes,
+            mr.sparse_kv_budget_plan.managed_hbm_bytes
+            + scale_layers * 4 * mr.page_size
+            + 128 * 128 * torch.bfloat16.itemsize,
+        )
+
+    def test_a5_c8_prices_persistent_hadamard_for_each_mtp_index_pool(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        draft_layers = 3
+        mr = _make_model_runner(
+            self,
+            num_layers=4,
+            use_mla_backend=True,
+            page_size=128,
+            max_running_requests=2,
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=draft_layers,
+            speculative_num_draft_tokens=4,
+            speculative_eagle_topk=1,
+        )
+        _configure_dsa_model(mr)
+        mr.model_config.hf_config.indexer_types = [
+            "full",
+            "shared",
+            "full",
+            "shared",
+        ]
+        mr.kv_cache_dtype = torch.float8_e4m3fn
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = draft_layers
+
+        with (
+            get_context().override_server_args(
+                attention_backend="ascend",
+                max_running_requests=2,
+                page_size=128,
+                speculative_algorithm="EAGLE",
+                speculative_num_steps=draft_layers,
+                speculative_num_draft_tokens=4,
+                speculative_eagle_topk=1,
+            ),
+            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+            envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
+            envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(8192),
+            envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
+            mock_cpu_env(kv_size=1),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
+                return_value=True,
+            ),
+            patch("sglang.srt.model_executor.pool_configurator._is_npu", True),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_sparsity_driven_kv_offload_enabled",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator._should_elide_dsa_index_k",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.cp.utils.get_glm_dsa_layer_split_effective_num_layers",
+                side_effect=lambda kvc, count: count,
+            ),
+        ):
+            cfg = DefaultPoolConfigurator(mr)
+
+        scale_layers = len(mr.get_dsa_indexer_layer_ids())
+        hadamard_bytes = 128 * 128 * torch.bfloat16.itemsize
+        self.assertEqual(
+            cfg._fixed_overhead_bytes,
+            mr.sparse_kv_budget_plan.managed_hbm_bytes
+            + scale_layers * 4 * mr.page_size
+            + (1 + draft_layers) * hadamard_bytes,
+        )
+
     def test_fused_draft_entry_overrides_the_layer_ratio(self):
         """A fused draft prices the exact fused entry (host + draft + pad);
         the per-draft-layer ratio under-reserves the pad."""

@@ -1,0 +1,483 @@
+"""CPU byte/ordering checks for the A5 MF adaptation; no NPU acceptance."""
+
+import ast
+import hashlib
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+
+import pytest
+import torch
+
+ROOT = Path(__file__).resolve().parents[3]
+SPARSE = ROOT / "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload"
+
+
+def load(name):
+    spec = importlib.util.spec_from_file_location(name, SPARSE / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+storage = load("a5_pd_pool")
+operations = load("a5_pd")
+
+
+class Group:
+    world_size = 2
+
+    def __init__(self, rank, messages):
+        self.rank_in_group, self.messages, self.cursor = rank, messages, 0
+        self.published = 0
+
+    def broadcast_object(self, value):
+        if self.rank_in_group == 0:
+            self.messages.append(value)
+        else:
+            value = self.messages[self.cursor]
+        self.cursor += 1
+        return value
+
+    def barrier(self):
+        pass
+
+    def broadcast(self, tensor, src):
+        self.published += 1
+
+
+class Offload:
+    OffloadConfig = SimpleNamespace
+    Scene = SimpleNamespace(SHARED="shared")
+
+    def __init__(self):
+        self.configs, self.allocations = [], []
+
+    def initialize(self, config):
+        self.configs.append(config)
+        return 0
+
+    def empty(self, shape, dtype, pin_memory):
+        tensor = torch.empty(shape, dtype=dtype)
+        self.allocations.append(tensor)
+        return tensor
+
+
+def copy_rows(src, dst, src_rows, dst_rows, valid, src_ndims, dst_ndims, **kwargs):
+    assert src_ndims == dst_ndims == 1
+    assert src.ndim == dst.ndim == 2
+    assert kwargs["src_ptr"] == src.data_ptr()
+    assert kwargs["dst_ptr"] == dst.data_ptr()
+    for source, target, enabled in zip(
+        src_rows.tolist(), dst_rows.tolist(), valid.tolist()
+    ):
+        if enabled:
+            dst[target].copy_(src[source])
+
+
+@pytest.fixture
+def shared(monkeypatch):
+    offload = Offload()
+    module = ModuleType("memfabric_hybrid")
+    module.offload = offload
+    monkeypatch.setitem(sys.modules, "memfabric_hybrid", module)
+    kernel = ModuleType("sgl_kernel_npu.sparsity_driven_kv_offload")
+    kernel.unidex_copy_inplace = copy_rows
+    monkeypatch.setitem(sys.modules, kernel.__name__, kernel)
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(current_device=lambda: 0, synchronize=lambda: None),
+        raising=False,
+    )
+    messages = []
+    owner = storage.A5PackedMFPool(
+        tokens=384, layers=2, device="cpu", group=Group(0, messages)
+    )
+    peer = storage.A5PackedMFPool(
+        tokens=384, layers=2, device="cpu", group=Group(1, messages)
+    )
+    return owner, peer, offload
+
+
+def test_one_physical_owner_byte_alias_and_page_offsets(shared):
+    owner, peer, offload = shared
+    assert len(offload.allocations) == 2
+    assert offload.configs[0].alloc_size > 0 and offload.configs[1].alloc_size == 0
+    assert offload.configs[0].store_url == offload.configs[1].store_url
+    ptrs, sizes, pages = owner.get_transfer_buf_infos()
+    for i, (host, alias) in enumerate(zip(owner.packed, peer.packed)):
+        assert host.data_ptr() == alias.data_ptr() == ptrs[i]
+        assert ptrs[i] % (2 * 1024**2) == 0
+        assert sizes[i] == 384 * 656 and pages[i] == 128 * 656
+        host.view(-1, 656)[128].fill_(97)
+        assert torch.equal(
+            alias.view(-1, 656)[128], torch.full((656,), 97, dtype=torch.int8)
+        )
+
+
+def test_masked_cross_page_copies_and_errors(shared):
+    owner, _, _ = shared
+    host = owner.packed[0]
+    source = torch.arange(64 * 656).remainder(127).to(torch.int8).view(64, 1, 656)
+    valid = torch.arange(64) % 2 == 0
+    old = torch.where(valid, torch.arange(64), -1)
+    new = torch.where(valid, old + 127, -1)
+    owner.copy_rows([source], [host], old, new, valid)
+    got = torch.zeros_like(source)
+    owner.copy_rows([host], [got], new, old, valid)
+    torch.testing.assert_close(got[valid], source[valid], rtol=0, atol=0)
+    assert not got[~valid].any()
+    with pytest.raises(ValueError, match="widths and dtypes"):
+        owner.copy_rows([source], [host[..., :655]], old, new, valid)
+
+
+def make_pool(shared):
+    owner, _, _ = shared
+    manager = SimpleNamespace(
+        mf_host_pool=owner,
+        host_pool=owner,
+        host_kv_buffer=owner.packed,
+        packed_c8=True,
+        device="cpu",
+        resets=[],
+    )
+    manager.reset_requests = lambda ids: manager.resets.append(ids)
+    pool = SimpleNamespace(
+        sparse_kv_manager=manager,
+        indexer_layer_id_to_slot={10: 0, 11: 1},
+        start_layer=10,
+        index_k_buffer=torch.arange(2 * 384 * 128)
+        .remainder(127)
+        .to(torch.uint8)
+        .view(2, 3, 128, 1, 128),
+        index_k_scale_buffer=torch.arange(2 * 384, dtype=torch.float32).view(
+            2, 3, 128, 1
+        ),
+        device="cpu",
+        cpu_offloading_chunk_size=2,
+    )
+    for i, host in enumerate(owner.packed):
+        host.copy_(
+            torch.arange(host.numel()).remainder(127).to(torch.int8).view_as(host) + i
+        )
+    return pool
+
+
+def test_overlapping_move_snapshot_semantics(shared):
+    pool = make_pool(shared)
+    manager = pool.sparse_kv_manager
+    src, dst = torch.tensor([127, 128, 129]), torch.tensor([128, 129, 127])
+    expected = [t.view(-1, 1, 656)[src].clone() for t in manager.host_kv_buffer]
+    operations.move_packed_kv(manager, dst, src)
+    for host, want in zip(manager.host_kv_buffer, expected):
+        torch.testing.assert_close(host.view(-1, 1, 656)[dst], want, rtol=0, atol=0)
+    assert manager.mf_host_pool.group.published == 1
+
+
+def test_retraction_restores_bytes_local_index_scales_and_invalidates_lim(shared):
+    pool = make_pool(shared)
+    src, dst = torch.tensor([127, 128, 255]), torch.tensor([12, 257, 258])
+    snapshot = operations.snapshot_packed_kv(pool, src)
+    expected = [[t.clone() for t in chunk] for chunk in snapshot[0]]
+    manager = pool.sparse_kv_manager
+    for host in manager.host_kv_buffer:
+        host.zero_()
+    pool.index_k_buffer.zero_()
+    pool.index_k_scale_buffer.zero_()
+    operations.restore_packed_kv(pool, snapshot, dst, 3)
+    for layer, host in enumerate(manager.host_kv_buffer):
+        for offset, destination in enumerate(dst):
+            chunk, row = divmod(offset, 2)
+            torch.testing.assert_close(
+                host.view(-1, 1, 656)[destination],
+                snapshot[layer][chunk][0][row],
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                pool.index_k_buffer[layer].view(-1, 1, 128)[destination],
+                snapshot[layer][chunk][1][row],
+                rtol=0,
+                atol=0,
+            )
+            assert (
+                pool.index_k_scale_buffer[layer].view(-1, 1)[destination]
+                == snapshot[layer][chunk][2][row]
+            )
+    assert manager.resets == [[3]]
+    assert torch.equal(expected[0][0], snapshot[0][0][0])
+    # Non-owner must restore its local index/scale but cannot overwrite shared KV.
+    manager.mf_host_pool.rank = 1
+    for host in manager.host_kv_buffer:
+        host.fill_(42)
+    pool.index_k_buffer.zero_()
+    operations.restore_packed_kv(pool, snapshot, dst, 4)
+    assert all(torch.all(host == 42) for host in manager.host_kv_buffer)
+    assert pool.index_k_buffer.any()
+    assert manager.resets[-1] == [4]
+    assert operations.snapshot_packed_kv(pool, src[:0]) == [[], []]
+
+
+def test_packed_pd_exports_host_then_device_state(shared):
+    # Execute the real class methods without importing serving-only dependencies.
+    source = ROOT / "python/sglang/srt/hardware_backend/npu/memory_pool_npu.py"
+    tree = ast.parse(source.read_text())
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "NPUMLATokenToKVPool"
+    )
+    names = {
+        "_get_disagg_buffer_entries",
+        "get_contiguous_buf_infos",
+        "get_kv_layer_ids",
+        "get_state_layer_ids",
+    }
+    methods = [
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    namespace = {"torch": torch}
+    exec(
+        compile(ast.Module(body=methods, type_ignores=[]), str(source), "exec"),
+        namespace,
+    )
+    pool = make_pool(shared)
+    (
+        pool.layer_num,
+        pool.dsa_kv_cache_store_fp8,
+        pool.indexer_layer_ids,
+        pool.dcp_size,
+        pool.index_head_dim,
+    ) = 2, True, (10, 11), 1, 128
+    for name in names:
+        setattr(pool, name, namespace[name].__get__(pool))
+    ptrs, sizes, pages = pool.get_contiguous_buf_infos()
+    assert len(ptrs) == len(pool.get_kv_layer_ids()) == 6
+    assert ptrs[:2] == [t.data_ptr() for t in pool.sparse_kv_manager.host_kv_buffer]
+    assert pages == [128 * 656] * 2 + [128 * 128] * 2 + [128 * 4] * 2
+    assert sizes[:2] == [384 * 656] * 2
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int64, torch.float8_e4m3fn])
+def test_packed_move_uses_a5_local_relocation_and_moves_index_state(
+    monkeypatch, index_dtype
+):
+    source = ROOT / "python/sglang/srt/hardware_backend/npu/memory_pool_npu.py"
+    tree = ast.parse(source.read_text())
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "NPUMLATokenToKVPool"
+    )
+    method = next(
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "move_kv_cache"
+    )
+    namespace = {"torch": torch, "maybe_detect_oob": lambda *args: None}
+    exec(
+        compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"),
+        namespace,
+    )
+    moves = []
+    module_name = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.a5_pd"
+    module = ModuleType(module_name)
+    module.move_packed_kv = lambda manager, target, source: moves.append(
+        (manager, target.clone(), source.clone())
+    )
+    monkeypatch.setitem(sys.modules, module_name, module)
+    manager = SimpleNamespace(packed_c8=True)
+    if index_dtype == torch.float8_e4m3fn:
+        index = (
+            torch.arange(2 * 8 * 128)
+            .remainder(256)
+            .to(torch.uint8)
+            .view(2, 8, 1, 128)
+            .view(index_dtype)
+        )
+    else:
+        index = torch.arange(2 * 8 * 3).view(2, 8, 1, 3)
+    scales = torch.arange(2 * 8, dtype=torch.float32).view(2, 8, 1)
+    pool = SimpleNamespace(
+        sparse_kv_manager=manager,
+        size=16,
+        page_size=1,
+        index_k_buffer=index,
+        index_k_scale_buffer=scales,
+    )
+    src = torch.tensor([1, 2, 3])
+    dst = torch.tensor([2, 3, 1])
+    expected_index = [
+        layer.flatten(0, 1).view(torch.uint8)[src].clone() for layer in index
+    ]
+    expected_scales = [layer.flatten(0, 1)[src].clone() for layer in scales]
+    namespace["move_kv_cache"](pool, dst, src)
+    assert len(moves) == 1
+    assert moves[0][0] is manager
+    torch.testing.assert_close(moves[0][1], dst)
+    torch.testing.assert_close(moves[0][2], src)
+    for layer, expected in zip(index, expected_index):
+        torch.testing.assert_close(
+            layer.flatten(0, 1).view(torch.uint8)[dst], expected, rtol=0, atol=0
+        )
+    for layer, expected in zip(scales, expected_scales):
+        torch.testing.assert_close(layer.flatten(0, 1)[dst], expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "dtype,packed_dim,index_dim,accepted",
+    [
+        (torch.bfloat16, None, 128, True),
+        (torch.float8_e4m3fn, 656, 128, True),
+        (torch.float8_e4m3fn, None, 128, False),
+        (torch.float8_e4m3fn, 576, 128, False),
+        (torch.float8_e4m3fn, 656, 64, False),
+        (torch.float16, None, 128, False),
+    ],
+)
+def test_pd_pool_admission_requires_the_actual_packed_c8_layout(
+    dtype, packed_dim, index_dim, accepted
+):
+    source = ROOT / "python/sglang/srt/hardware_backend/npu/memory_pool_npu.py"
+    tree = ast.parse(source.read_text())
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "NPUMLATokenToKVPool"
+    )
+    init = next(
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    guard = next(
+        node
+        for node in init.body
+        if isinstance(node, ast.If)
+        and "Ascend PD split KV requires"
+        in ast.get_source_segment(source.read_text(), node)
+    )
+    namespace = dict(
+        torch=torch,
+        self=SimpleNamespace(enable_sparsity_driven_kv_offload=True, use_fia_nz=False),
+        envs=SimpleNamespace(
+            SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA=SimpleNamespace(get=lambda: True)
+        ),
+        get_disagg=lambda: SimpleNamespace(disaggregation_mode="decode"),
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        page_size=128,
+        dtype=dtype,
+        kv_cache_dim=packed_dim,
+        index_head_dim=index_dim,
+        modelslim_cache_layout=None,
+    )
+    code = compile(ast.Module(body=[guard], type_ignores=[]), str(source), "exec")
+    if accepted:
+        exec(code, namespace)
+    else:
+        with pytest.raises(ValueError, match="Ascend PD split KV"):
+            exec(code, namespace)
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_pd_launcher_keeps_c8_mtp_graph_and_radix(role):
+    bash = shutil.which("bash")
+    if sys.platform == "win32":
+        bash = r"C:\Program Files\Git\bin\bash.exe"
+    if not bash:
+        pytest.skip("bash unavailable")
+    env = os.environ.copy()
+    env.update(
+        PREFILL_IP="192.0.2.1",
+        DECODE_IP="192.0.2.2",
+        MODEL_PATH="/weights/a5",
+        FRAMEWORK_ROOT="/repo",
+        KERNEL_ROOT="/kernel",
+    )
+    result = subprocess.run(
+        [bash, str(ROOT / "benchmark/hisparse/a5_pd/launch.sh"), role, "--dry-run"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert f"--disaggregation-mode {role}" in result.stdout
+    assert "--kv-cache-dtype fp8_e4m3" in result.stdout
+    assert "--speculative-num-draft-tokens 4" in result.stdout
+    assert (
+        "SGLANG_NPU_ENABLE_PD_SPLIT_KV"
+        not in (ROOT / "benchmark/hisparse/a5_pd/launch.sh").read_text()
+    )
+    if role == "decode":
+        assert "KV_OFFLOAD=1" in result.stdout and "GRAPH=1" in result.stdout
+        assert "--disaggregation-decode-enable-radix-cache" in result.stdout
+        assert "--disaggregation-decode-extra-slots 0" in result.stdout
+    else:
+        assert "KV_OFFLOAD=0" in result.stdout
+
+
+@pytest.mark.parametrize("failure", [None, "cache", "tokens", "retraction"])
+def test_pd_smoke_rejects_invalid_evidence(tmp_path, monkeypatch, failure):
+    spec = importlib.util.spec_from_file_location(
+        "a5_pd_smoke", ROOT / "benchmark/hisparse/a5_pd/smoke.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    inputs = [[11] * 512]
+    response = dict(
+        text="731954",
+        output_ids=[7] * 64,
+        meta_info=dict(
+            prompt_tokens=512,
+            completion_tokens=64,
+            cached_tokens=384,
+            num_retractions=1 if failure != "retraction" else 0,
+        ),
+    )
+    reference = dict(
+        status="pass",
+        inputs=inputs,
+        fixture_sha256=hashlib.sha256(json.dumps(inputs).encode()).hexdigest(),
+        cases=[dict(cold=[response])],
+    )
+    ref = tmp_path / "reference.json"
+    ref.write_text(json.dumps(reference))
+
+    def post(url, body):
+        if url.endswith("/flush_cache"):
+            return {}
+        result = json.loads(json.dumps(response))
+        if failure == "cache":
+            result["meta_info"]["cached_tokens"] = 0
+        if failure == "tokens":
+            result["output_ids"][10] = 8
+        return result
+
+    monkeypatch.setattr(module, "post", post)
+    args = SimpleNamespace(
+        output=tmp_path / "run",
+        reference=ref,
+        lengths=[512],
+        concurrency=2,
+        prefill_url="http://p",
+        decode_url="http://d",
+        base_url="http://router",
+        require_retraction=True,
+    )
+    if failure:
+        with pytest.raises(ValueError):
+            module.run(args)
+    else:
+        module.run(args)
+        assert (
+            json.loads((args.output / "summary.json").read_text())["status"] == "pass"
+        )

@@ -5,7 +5,10 @@ import torch
 
 pytest.importorskip("torch_npu")
 
-from sglang.kernels.ops.kvcache import prepare_sparse_kv_publication
+from sglang.kernels.ops.kvcache import (
+    prepare_sparse_kv_publication,
+    prepare_sparse_kv_publication_rows,
+)
 
 pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="NPU required")
 
@@ -15,7 +18,8 @@ pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="NPU requir
     [("decode", 1), ("verify", 4), ("verify", 14), ("compact", 1), ("padded", 1)],
 )
 @pytest.mark.parametrize("real_shape", [False, True])
-def test_publication(mode, q, real_shape):
+@pytest.mark.parametrize("metadata_only", [False, True])
+def test_publication(mode, q, real_shape, metadata_only):
     prefill = mode in ("compact", "padded")
     lengths = [2, 0, 3] if mode == "compact" else [2, 0, 1]
     if real_shape:
@@ -55,6 +59,21 @@ def test_publication(mode, q, real_shape):
     prefix = torch.tensor([3, 4], device=device, dtype=torch.int32)
 
     def call():
+        if metadata_only:
+            return prepare_sparse_kv_publication_rows(
+                req,
+                seq,
+                positions,
+                loc,
+                tokens=tokens,
+                request_rows=20,
+                context_len=20,
+                host_capacity=50,
+                query_width=q,
+                extend_seq_lens=ext if prefill else None,
+                extend_prefix_lens=prefix if prefill else None,
+                compact_prefill=mode == "compact",
+            )
         return prepare_sparse_kv_publication(
             k,
             rope,
@@ -72,7 +91,7 @@ def test_publication(mode, q, real_shape):
         )
 
     def check(result):
-        src, dst, pos, valid, current = result
+        src, dst, pos, valid = result[:4]
         req_cpu, seq_cpu, loc_cpu = req.cpu(), seq.cpu(), loc.cpu()
         lengths = ext.cpu().tolist()
         expected_pos, expected_valid = [], []
@@ -104,11 +123,13 @@ def test_publication(mode, q, real_shape):
         torch.testing.assert_close(
             valid.cpu(), torch.tensor(expected_valid), rtol=0, atol=0
         )
-        if prefill:
-            assert current[0] is k and current[1] is rope
+        if metadata_only:
+            assert len(result) == 4
+        elif prefill:
+            assert result[4][0] is k and result[4][1] is rope
         else:
             torch.testing.assert_close(
-                current, torch.cat((k, rope), dim=-1), rtol=0, atol=0
+                result[4], torch.cat((k, rope), dim=-1), rtol=0, atol=0
             )
 
     check(call())

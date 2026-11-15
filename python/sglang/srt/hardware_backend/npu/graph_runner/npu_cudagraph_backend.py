@@ -30,6 +30,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.dcp import get_mla_dcp_backend
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    is_copy_sfa_decode_graph_eligible,
+)
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -447,6 +450,20 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._outputs[shape_key] = out
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
+        attn_backend = getattr(self._decode_runner, "attn_backend", None)
+        attn_backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+        manager = getattr(attn_backend, "sparse_kv_manager", None)
+        packed_c8 = bool(getattr(manager, "packed_c8", False))
+        if packed_c8 and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            # The captured C8 path assumes a complete resident prefix. Short
+            # and mixed batches must stay on the eager vendor QSFA fallback.
+            if not is_copy_sfa_decode_graph_eligible(
+                forward_batch.seq_lens_cpu, packed_c8=True
+            ):
+                return False
         return shape_key in self._graphs
 
     @contextmanager

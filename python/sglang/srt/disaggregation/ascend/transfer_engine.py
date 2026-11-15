@@ -8,6 +8,7 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     MooncakeTransferEngine,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils.network import NetworkAddress
 
 try:
@@ -41,7 +42,9 @@ class AscendTransferEngine(MooncakeTransferEngine):
         self.npu_id = npu_id
 
         # Centralized storage address of the AscendTransferEngine
-        self.store_url = os.getenv("ASCEND_MF_STORE_URL")
+        self.store_url = os.getenv("MF_CONFIG_STORE_URL") or os.getenv(
+            "ASCEND_MF_STORE_URL"
+        )
         if disaggregation_mode == DisaggregationMode.PREFILL:
             self.role = "Prefill"
         elif disaggregation_mode == DisaggregationMode.DECODE:
@@ -86,10 +89,19 @@ class AscendTransferEngine(MooncakeTransferEngine):
     def batch_register(self, ptrs: List[int], lengths: List[int]):
         try:
             ret_value = self.engine.batch_register_memory(ptrs, lengths)
-        except Exception:
+        except Exception as error:
+            if envs.SGLANG_NPU_ENABLE_PD_SPLIT_KV.get():
+                raise RuntimeError(
+                    "Ascend PD split-KV memory registration raised an exception."
+                ) from error
             # Mark register as failed
             ret_value = -1
         if ret_value != 0:
+            if envs.SGLANG_NPU_ENABLE_PD_SPLIT_KV.get():
+                raise RuntimeError(
+                    "Ascend PD split-KV memory registration failed; check the "
+                    "MF/HDK/LingQu stack and registered GVA ranges."
+                )
             logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
 
     @staticmethod
@@ -101,6 +113,11 @@ class AscendTransferEngine(MooncakeTransferEngine):
     def _resolve_trans_op_type(protocol: str):
         op_type = getattr(TransferEngine.TransDataOpType, protocol.upper(), None)
         if op_type is None:
+            if envs.SGLANG_NPU_ENABLE_PD_SPLIT_KV.get():
+                raise ValueError(
+                    f"Ascend PD split-KV requires MF protocol {protocol!r}; "
+                    "the installed memfabric_hybrid does not provide it."
+                )
             logger.warning(
                 "Transfer protocol %r is not supported by the installed "
                 "memfabric_hybrid, falling back to %r.",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
@@ -184,6 +185,14 @@ def get_sparse_kv_budget(
     query_heads = model_config.num_attention_heads // get_parallel().attn_tp_size
     # Native SFA accepts 1..64 or 128 query heads per KV head.
     copy_sfa_query_heads = 128 if 64 < query_heads < 128 else query_heads
+    if kv_dtype == torch.float8_e4m3fn:
+        # The Ascend950 C8 operator has a narrower, power-of-two head ABI.
+        if query_heads <= 0:
+            raise ValueError("A5 C8 requires a positive per-rank query head count.")
+        copy_sfa_query_heads = next(
+            (heads for heads in (8, 16, 32, 64, 128) if heads >= query_heads),
+            0,
+        )
     disagg = get_disagg()
     prefill_rows = request_rows - 1
     if disagg.disaggregation_mode == "decode":
@@ -203,7 +212,14 @@ def get_sparse_kv_budget(
             graph_batch_capacity = get_cuda_graph_max_batch_size(request_rows)
             if decode is not None and decode.bs:
                 graph_batch_capacity = min(max(decode.bs), graph_batch_capacity)
-    return resolve_sparse_kv_budget(
+    resolve = resolve_sparse_kv_budget
+    if kv_dtype == torch.float8_e4m3fn:
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.c8_budget import (
+            resolve_c8_budget,
+        )
+
+        resolve = partial(resolve_c8_budget, mf_shared=envs.SGLANG_NPU_A5_PD_MF.get())
+    return resolve(
         model_config=model_config,
         page_size=page_size,
         request_rows=request_rows,
@@ -223,6 +239,19 @@ def get_sparse_kv_budget(
             get_eager_max_batch_size(request_rows - 1),
         ),
     )
+
+
+def is_copy_sfa_decode_graph_eligible(seq_lens_cpu, *, packed_c8=False):
+    """Keep short C8 requests on the existing eager vendor fallback."""
+    if not packed_c8:
+        return True
+    if seq_lens_cpu is None:
+        return False
+    width = get_sparse_kv_max_query_width()
+    capacity = envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get() or width * 2048
+    # The stable prefix must cover C. The separate two-page ring stores the
+    # unfinished page and Q4 crossing; it does not add256 to this threshold.
+    return all(int(n) == 0 or int(n) >= capacity + 128 for n in seq_lens_cpu)
 
 
 def get_sparse_kv_max_query_width() -> int:

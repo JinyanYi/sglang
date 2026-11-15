@@ -1220,10 +1220,29 @@ class Envs:
     # routed front / DeepEP dispatch / routed GEMMs, respectively.
     SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
+    # Optional out-of-tree A5 LIM operator library. CopySFA remains in the
+    # paired sgl-kernel-npu wheel; only load this path when the LIM schema is
+    # not already registered by the active runtime.
+    SGLANG_NPU_A5_LIM_LIBRARY = EnvStr("")
     # Fuse grouped Kimi-K3 SiTU with valid-row MXFP8 quantization before GMM2.
     # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.
     SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
+    # Compatibility controls retained for the A5 handoff/debug harnesses. The
+    # production route is selected by ENABLE_FUSED_LIM_COPYSFA below and does
+    # not require ENABLE_COPY_SFA to be set.
+    SGLANG_NPU_ENABLE_COPY_SFA = EnvBool(False)
+    SGLANG_NPU_SPARSE_KV_INDEXER = EnvStr("legacy")
+    SGLANG_NPU_FUSED_LIM_PRE_METADATA = EnvBool(True)
+    SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA = EnvBool(True)
+    # Opt-in A5 v2 operator capabilities. The fused circular-tail path is
+    # valid only together with the split-query ABI and is validated at use.
+    SGLANG_NPU_A5_C8_SPLIT_QUERY = EnvBool(False)
+    SGLANG_NPU_A5_C8_FUSED_RING_TAIL = EnvBool(False)
+    # Store packed C8 host rows in MemFabric SHARED memory on an A5 decode
+    # worker. Keep this independent from the generic split-KV switch because
+    # prefill owns native transferable pages while decode owns packed C8 rows.
+    SGLANG_NPU_A5_PD_MF = EnvBool(False)
     # Per-request resident token capacity; 0 defaults to model TopK or auto-sizes
     # from the manager HBM budget. Legacy uses LRU when C > K;
     # native LIM maintains its own resident mapping.
@@ -1760,6 +1779,8 @@ class Envs:
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
     # capacity).
     SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+    # Opt-in snapshots for diagnosing the stock FP8 lightning-indexer path.
+    SGLANG_NPU_QUANT_LI_DEBUG_DIR = EnvStr("")
 
     # ===================================================================
     # Multimodal processing

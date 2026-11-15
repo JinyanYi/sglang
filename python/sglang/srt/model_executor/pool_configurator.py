@@ -326,11 +326,19 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         top_k=get_sparsity_driven_kv_offload_sparse_context_len(
                             model_config=kvc.model_config
                         ),
+                        # A5 stores one opaque C8 record per token: 512 FP8
+                        # latent bytes, 128 BF16 RoPE bytes and four FP32
+                        # dequant scales. Preserve that complete ABI in both
+                        # HBM reservation and MF host sizing.
                         kv_bytes_per_token=(
-                            kvc.model_config.kv_lora_rank
-                            + kvc.model_config.qk_rope_head_dim
-                        )
-                        * torch._utils._element_size(kvc.kv_cache_dtype),
+                            656
+                            if kvc.kv_cache_dtype == torch.float8_e4m3fn
+                            else (
+                                kvc.model_config.kv_lora_rank
+                                + kvc.model_config.qk_rope_head_dim
+                            )
+                            * torch._utils._element_size(kvc.kv_cache_dtype)
+                        ),
                     )
                     kvc.sparse_kv_budget_plan = get_sparse_kv_budget(
                         num_layers=num_layers,
@@ -343,6 +351,26 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     budget.context_len, 2 * (budget.request_rows - 1)
                 )
                 self._fixed_overhead_bytes += budget.managed_hbm_bytes
+                if getattr(budget, "packed_c8", False):
+                    # The native FP8 index cache owns one FP32 scale per token
+                    # for every physical indexer layer. These are transferred
+                    # in PD and cannot be priced as one shared workspace.
+                    scale_layers = len(kvc.get_dsa_indexer_layer_ids())
+                else:
+                    # BF16 fused LIM keeps one shared FP32 workspace.
+                    scale_layers = 1
+                scale_bytes_per_token = budget.scale_element_size * scale_layers
+                self._cell_size += scale_bytes_per_token
+                # Each physical indexer layer also allocates one dummy scale
+                # page beside its token capacity.
+                self._fixed_overhead_bytes += (
+                    scale_bytes_per_token * get_schedule().page_size
+                )
+                if getattr(budget, "packed_c8", False):
+                    # NPUMLATokenToKVPool retains a BF16 128x128 Hadamard
+                    # matrix for every FP8 index pool. This target allocation
+                    # does not scale with token capacity.
+                    self._fixed_overhead_bytes += 128 * 128 * torch.bfloat16.itemsize
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
@@ -359,6 +387,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(num_layers) > 0
             ):
                 draft_num_layers = int(eagle_draft_num_layers)
+                if getattr(self._sparse_budget, "packed_c8", False):
+                    # Multi-layer EAGLE owns one native FP8 index pool per
+                    # draft step, and each pool retains its own Hadamard.
+                    self._fixed_overhead_bytes += (
+                        draft_num_layers * 128 * 128 * torch.bfloat16.itemsize
+                    )
                 draft_loc_space_scale = 1
                 if get_memory().enable_hisparse:
                     from sglang.srt.mem_cache.sparsity import parse_hisparse_config

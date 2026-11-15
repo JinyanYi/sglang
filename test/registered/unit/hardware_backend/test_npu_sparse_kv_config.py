@@ -4,6 +4,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload import config
@@ -91,9 +92,55 @@ def test_budget_validates_normalized_query_geometry(
                 make_plan()
 
 
+def test_a5_c8_rounds_query_heads_to_supported_power_of_two(monkeypatch):
+    monkeypatch.setattr(config, "get_parallel", lambda: SimpleNamespace(attn_tp_size=1))
+    monkeypatch.setattr(
+        config,
+        "get_schedule",
+        lambda: SimpleNamespace(page_size=128, prefill_max_requests=None),
+    )
+    monkeypatch.setattr(
+        config,
+        "get_disagg",
+        lambda: SimpleNamespace(
+            disaggregation_mode="null", enable_pd_role_switch=False
+        ),
+    )
+    monkeypatch.setattr(
+        config, "get_spec", lambda: SimpleNamespace(speculative_num_draft_tokens=1)
+    )
+    monkeypatch.setattr(config, "get_eager_max_batch_size", lambda _: 4)
+    model = SimpleNamespace(**vars(MODEL_CONFIG))
+    model.hf_config = SimpleNamespace(**vars(MODEL_CONFIG.hf_config))
+    model.hf_config.index_topk = 2048
+    model.num_attention_heads = 33
+    model.dtype = torch.bfloat16
+
+    with (
+        envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(8192),
+        envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
+        envs.SGLANG_NPU_A5_PD_MF.override(False),
+    ):
+        plan = config.get_sparse_kv_budget(
+            model_config=model,
+            request_rows=3,
+            context_len=1024,
+            num_layers=2,
+            top_k=2048,
+            kv_bytes_per_token=656,
+            graph_batch_capacity=4,
+            kv_dtype=torch.float8_e4m3fn,
+        )
+
+    assert plan.copy_sfa_query_heads == 64
+
+
 @pytest.mark.parametrize("fused", [False, True])
 @pytest.mark.parametrize("draft", [False, True])
 def test_draft_policy_is_private_to_fused_mode(monkeypatch, fused, draft):
+    monkeypatch.setattr(
+        config, "get_disagg", lambda: SimpleNamespace(disaggregation_mode="null")
+    )
     monkeypatch.setattr(config, "is_npu", lambda: True)
     monkeypatch.setattr(config, "is_deepseek_dsa", lambda _: True)
     monkeypatch.setattr(config, "attention_backends", lambda: ("ascend", "ascend"))

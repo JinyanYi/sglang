@@ -23,6 +23,14 @@ if is_npu():
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 
+def _get_npu_quant_lightning_indexer(query):
+    # Recipes custom_ops may replace torch_npu's Python entry point with an
+    # incompatible multi-output schema. FP8 DSA uses the stock dispatcher.
+    if query.dtype == torch.float8_e4m3fn:
+        return torch.ops.npu.npu_quant_lightning_indexer
+    return torch_npu.npu_quant_lightning_indexer
+
+
 @lru_cache(maxsize=1)
 def _create_hadamard_128_cpu() -> torch.Tensor:
     matrix = [[1.0]]
@@ -316,19 +324,55 @@ class DSANPUIndexerMixin:
                 and getattr(backend, "use_fused_sparse_kv", False)
                 and not is_prefill
             ):
-                if use_quant_indexer:
-                    raise ValueError("Native LIM requires BF16 index keys.")
-                plan = manager.lim_adapter.select(
-                    manager,
-                    query=q.view(-1, self.n_heads, self.head_dim),
-                    weights=weights,
-                    key=past_key_states,
-                    block_table=block_table,
-                    forward_batch=forward_batch,
-                    layer_id=layer_id,
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
+                    use_native_mtp_verify,
                 )
-                backend.forward_metadata.sparse_kv_lim_plan = plan
-                return plan.source_ids
+
+                lim_query = q.view(-1, self.n_heads, self.head_dim)
+                quant_args = {}
+                if use_quant_indexer:
+                    if not getattr(manager, "packed_c8", False):
+                        raise ValueError(
+                            "Quantized target LIM requires the A5 C8 bridge."
+                        )
+                    lim_query, query_scale = _quantize_npu_indexer_activation(
+                        lim_query, pool.indexer_hadamard_128, pool.dtype
+                    )
+                    quant_args = {
+                        "query_scale": query_scale,
+                        "key_scale": pool.get_index_k_scale_buffer(layer_id),
+                    }
+
+                if use_native_mtp_verify(backend, forward_batch, manager):
+                    plan = manager.lim_adapter.select_mtp(
+                        manager,
+                        query=lim_query,
+                        weights=weights,
+                        key=past_key_states,
+                        block_table=block_table,
+                        forward_batch=forward_batch,
+                        layer_id=layer_id,
+                        **quant_args,
+                    )
+                    backend.forward_metadata.sparse_kv_lim_plan = plan
+                    return plan.source_ids
+
+                if (
+                    forward_batch.forward_mode.is_decode()
+                    and forward_batch.spec_info is None
+                ):
+                    plan = manager.lim_adapter.select(
+                        manager,
+                        query=lim_query,
+                        weights=weights,
+                        key=past_key_states,
+                        block_table=block_table,
+                        forward_batch=forward_batch,
+                        layer_id=layer_id,
+                        **quant_args,
+                    )
+                    backend.forward_metadata.sparse_kv_lim_plan = plan
+                    return plan.source_ids
 
             if use_quant_indexer:
                 query, query_scale = _quantize_npu_indexer_activation(
@@ -336,7 +380,7 @@ class DSANPUIndexerMixin:
                     pool.indexer_hadamard_128,
                     pool.dtype,
                 )
-                topk_indices = torch_npu.npu_quant_lightning_indexer(
+                quant_li_args = dict(
                     query=query,
                     key=past_key_states,
                     weights=weights,
@@ -354,6 +398,21 @@ class DSANPUIndexerMixin:
                     query_quant_mode=0,
                     key_quant_mode=0,
                 )
+                quant_li = _get_npu_quant_lightning_indexer(query)
+                if envs.SGLANG_NPU_QUANT_LI_DEBUG_DIR.get():
+                    from sglang.srt.hardware_backend.npu.quant_li_debug import (
+                        snapshot_draft_li,
+                    )
+
+                    snapshot_draft_li(
+                        quant_li_args,
+                        forward_batch,
+                        backend,
+                        layer_id,
+                        envs.SGLANG_NPU_QUANT_LI_DEBUG_DIR.get(),
+                        operator=quant_li,
+                    )
+                topk_indices = quant_li(**quant_li_args)
                 return topk_indices.squeeze(1)
 
             topk_indices = torch_npu.npu_lightning_indexer(
