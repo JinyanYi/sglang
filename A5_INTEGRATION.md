@@ -93,3 +93,29 @@ rewrites, request reuse and shared radix prefixes. Compare v2 split-only and
 internal-ring modes independently against the retained path. MF byte transfer,
 P/D correctness and matched unprofiled serving measurements are separate gates.
 Historical donor test/benchmark results are not acceptance for this branch.
+
+## Native four-stream accuracy reference
+
+`test/manual/npu/test_native_four_stream_alignment.py` invokes the original
+four-stream manager/materialization/SFA path and the latest fused LIM/CopySFA
+path using independent Host and HBM allocations. The initial A3 BF16 case uses
+Q1, eight query heads, K=2048, C=8192 and 8704 visible tokens, with cold and warm
+iterations. One case freezes the LIM selection into both paths; another calls
+the actual native indexer independently and compares canonical selected-token
+sets. Both check selected KV exactly and compare live attention outputs to each
+other and to an FP32 CPU oracle. Native invalid token IDs use -1, while LIM uses a separate
+row-valid mask; the reference adapter translates only the padding rows. Native
+SFA's tiny padding residual is recorded separately from live output errors.
+
+This is a transport/attention-chain gate with one separated-score indexer case,
+not broad indexer acceptance. Next cover realistic score distributions and
+causal visibility, then replay a frozen full forward step with per-layer hidden-state and logit
+comparisons. Freeze speculative candidates and acceptance decisions while
+finding the first divergence; follow with several steps covering page/ring
+crossings, rejection, relocation and request reuse. A single matching step does
+not establish lifecycle correctness.
+
+For A5, populate the reference with the same packed C8 bytes and scales (or
+their decoded values). Compare the retained and candidate routes in that same
+quantization domain before measuring differences from a BF16 model reference.
+The A3 BF16 gate cannot certify A5 FP8 LIM/CopySFA, Q4 or P/D correctness.
