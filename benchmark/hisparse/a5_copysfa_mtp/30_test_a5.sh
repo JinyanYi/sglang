@@ -20,18 +20,24 @@ activate_joint_opp
 export FRAMEWORK_ROOT
 
 run_logged preflight "$PYTHON_BIN" "$HANDOFF_DIR/preflight.py" --mode "$MODE"
-run_logged kernel_a5 "$PYTHON_BIN" -m pytest -q --junitxml="$RUN_DIR/kernel-a5.xml" \
-  "$KERNEL_ROOT/tests/test_fused_quant_scatter_copy_sparse_flash_attention.py" \
+kernel_tests=(
+  "$KERNEL_ROOT/tests/python/sgl_kernel_npu/test_a5_c8_metadata.py"
+  "$KERNEL_ROOT/tests/python/sgl_kernel_npu/test_a5_c8_tail_transport.py"
+  "$KERNEL_ROOT/tests/test_fused_quant_scatter_copy_sparse_flash_attention.py"
   "$KERNEL_ROOT/tests/test_fused_quant_scatter_copy_sparse_flash_attention_a5.py"
+)
+if [[ "$MODE" == model ]]; then
+  kernel_tests+=("$KERNEL_ROOT/tests/python/sgl_kernel_npu/test_a5_lim_copysfa_joint.py")
+fi
+run_logged kernel_a5 "$PYTHON_BIN" -m pytest -q --junitxml="$RUN_DIR/kernel-a5.xml" "${kernel_tests[@]}"
 
 framework_tests=(
-  "$FRAMEWORK_ROOT/test/manual/npu/test_a5_copy_sfa_metadata.py"
-  "$FRAMEWORK_ROOT/test/manual/npu/test_sparse_kv_packed_transport.py"
+  "$FRAMEWORK_ROOT/test/manual/npu/test_c8_metadata_adapter_cpu.py"
+  "$FRAMEWORK_ROOT/test/manual/npu/test_a5_copy_sfa_contract.py"
 )
 if [[ "$MODE" == model ]]; then
   framework_tests+=(
     "$FRAMEWORK_ROOT/test/manual/npu/test_a5_external_lim_contract.py"
-    "$FRAMEWORK_ROOT/test/manual/npu/test_a5_lim_copysfa_joint.py"
   )
 fi
 for path in "${framework_tests[@]}"; do require_file "$path"; done

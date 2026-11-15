@@ -276,7 +276,7 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
                 forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_decode()
             ):
-                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_mtp_tail import (
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.c8_metadata import (
                     stage_mtp_tail,
                 )
 

@@ -7,14 +7,18 @@ require_dir "$FRAMEWORK_ROOT"
 require_dir "$KERNEL_ROOT"
 prepend_framework_python
 
+run_logged c8_metadata_cpu env TORCH_DEVICE_BACKEND_AUTOLOAD=0 TRITON_INTERPRET=1 \
+  "$PYTHON_BIN" -m pytest -q \
+  "$KERNEL_ROOT/tests/python/sgl_kernel_npu/test_a5_c8_metadata_cpu.py"
+
 require_file "$FRAMEWORK_ROOT/test/manual/npu/test_a5_copy_sfa_contract.py"
 require_file "$FRAMEWORK_ROOT/test/manual/npu/test_sparse_kv_offload_cache.py"
-run_logged kernel_cpu "$PYTHON_BIN" -m pytest -q \
-  "$KERNEL_ROOT/tests/test_fused_quant_scatter_copy_sparse_flash_attention_cpu.py" \
-  "$KERNEL_ROOT/tests/test_copysfa_a5_ab_fixture.py" \
-  "$KERNEL_ROOT/tests/test_copysfa_a5_reference_package.py"
+run_logged kernel_cpu env PYTHONPATH="$KERNEL_ROOT/tests${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON_BIN" -m pytest -q \
+  "$KERNEL_ROOT/tests/test_fused_quant_scatter_copy_sparse_flash_attention_cpu.py"
 
 run_logged framework_source_cpu "$PYTHON_BIN" -m pytest -q \
+  "$FRAMEWORK_ROOT/test/manual/npu/test_c8_metadata_adapter_cpu.py" \
   "$FRAMEWORK_ROOT/test/manual/npu/test_a5_joint_handoff_cpu.py" \
   "$FRAMEWORK_ROOT/test/manual/npu/test_npu_draft_extend_capture_metadata.py" \
   "$FRAMEWORK_ROOT/test/manual/npu/test_quant_li_debug_cpu.py" \

@@ -1,6 +1,7 @@
 """Run the existing A5 LIM/CopySFA precision gates with actual MF C8 storage."""
 
 import importlib.util
+import os
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,7 @@ pytest.importorskip("torch_npu")
 @pytest.mark.parametrize("width", [1, 4])
 @pytest.mark.parametrize("graph_mode", [False, True])
 def test_real_lim_copysfa_mf(width, graph_mode, monkeypatch):
-    import sgl_kernel_npu.sparsity_driven_kv_offload as transport
+    import sgl_kernel_npu.sparsity_driven_kv_offload.fused_shm as transport
 
     from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.a5_pd_pool import (
         A5PackedMFPool,
@@ -38,11 +39,12 @@ def test_real_lim_copysfa_mf(width, graph_mode, monkeypatch):
         tensor = pool.packed[0].view(shape)
         return tensor, tensor.data_ptr(), tensor.data_ptr()
 
-    monkeypatch.setattr(transport, "create_shm_tensor", allocate)
-    monkeypatch.setattr(transport, "free_shm", lambda: None)
-    root = Path(__file__).resolve().parents[3]
+    monkeypatch.setattr(transport, "create_fused_shm_tensor", allocate)
+    monkeypatch.setattr(transport, "free_fused_shm", lambda: None)
+    root = Path(os.environ["KERNEL_ROOT"])
     spec = importlib.util.spec_from_file_location(
-        "a5_joint_oracle", root / "test/manual/npu/test_a5_lim_copysfa_joint.py"
+        "a5_joint_oracle",
+        root / "tests/python/sgl_kernel_npu/test_a5_lim_copysfa_joint.py",
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

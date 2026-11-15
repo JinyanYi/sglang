@@ -38,8 +38,12 @@ in one metadata launch. The metadata-only entry retains the opaque C8 payload;
 it does not concatenate unused BF16 KV. The public A3 payload adapter keeps its
 existing prefill tuple and decode concatenation behavior. Draft KV stays native.
 
-C8 pre/post LIM metadata lives in `c8_metadata.py`, with admission and optional
-chain diagnostics in `c8_mtp.py`. The A3 manager, budget, MTP module and public
+C8 pre/post LIM metadata and ring staging live in the companion kernel package's
+`sparsity_driven_kv_offload/c8_metadata.py`; the framework's matching module only
+forwards calls. Admission and optional chain diagnostics remain in `c8_mtp.py`.
+Tensor-only metadata, tail and LIM/CopySFA joint tests live in the kernel
+repository under `tests/python/sgl_kernel_npu/`. Framework tests retain routing,
+budget, lifecycle and call forwarding. The A3 manager, budget, MTP module and public
 pre/post metadata retain the latest PR implementations. C8 pre-metadata derives
 its stable page prefix from actual positions; post-metadata rotates HBM pages
 and clears invalid source/slot rows in one launch. Accepted-token moves and

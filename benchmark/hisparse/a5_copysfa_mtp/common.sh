@@ -6,7 +6,7 @@ HANDOFF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FRAMEWORK_ROOT="${FRAMEWORK_ROOT:-$(cd "$HANDOFF_DIR/../../.." && pwd)}"
 KERNEL_ROOT="${KERNEL_ROOT:-$(cd "$FRAMEWORK_ROOT/.." && pwd)/sgl-kernel-npu}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-EXPECTED_BRANCH="${EXPECTED_BRANCH:-integrate/a5-c8-ring-pr47383-pr909-20261113}"
+EXPECTED_BRANCH="${EXPECTED_BRANCH:-integrate/a5-c8-ring-pr47383-pr909-20261115}"
 
 require_file() {
   [[ -f "$1" ]] || { echo "Required file is missing: $1" >&2; return 2; }
