@@ -324,7 +324,7 @@ class DSANPUIndexerMixin:
                 and getattr(backend, "use_fused_sparse_kv", False)
                 and not is_prefill
             ):
-                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.c8_mtp import (
                     use_native_mtp_verify,
                 )
 
@@ -357,7 +357,7 @@ class DSANPUIndexerMixin:
                     backend.forward_metadata.sparse_kv_lim_plan = plan
                     return plan.source_ids
 
-                if (
+                if not getattr(manager, "packed_c8", False) or (
                     forward_batch.forward_mode.is_decode()
                     and forward_batch.spec_info is None
                 ):
