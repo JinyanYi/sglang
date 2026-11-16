@@ -40,6 +40,7 @@ def fixture(width=4):
     cache.query = torch.full((rows, heads, 576), -17, dtype=torch.bfloat16)
     cache.query_ends = {width: torch.tensor([width, 2 * width], dtype=torch.int32)}
     cache.operator, cache.operator_v2 = object(), v2
+    cache.hit_recorder = None
     cache.split_query, cache.fused_ring_tail = True, True
     manager = SimpleNamespace(
         lim_adapter=SimpleNamespace(copy_sfa_metadata=lambda manager, plan: None),

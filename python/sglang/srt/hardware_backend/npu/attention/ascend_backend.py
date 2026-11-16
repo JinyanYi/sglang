@@ -620,11 +620,18 @@ class AscendAttnBackend(AttentionBackend):
     ):
         pass
 
+    def _report_c8_hit_statistics(self, *, in_capture=False):
+        manager = getattr(self, "sparse_kv_manager", None)
+        recorder = getattr(getattr(manager, "c8_cache", None), "hit_recorder", None)
+        if recorder is not None:
+            recorder.maybe_report(in_capture=in_capture)
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        self._report_c8_hit_statistics(in_capture=in_capture)
         bs = forward_batch.batch_size
         if in_capture:
             self._init_cuda_graph_metadata(
@@ -655,6 +662,7 @@ class AscendAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        self._report_c8_hit_statistics()
         self.forward_metadata = ForwardMetadata()
         dense_mla_dcp_partial = self.dense_mla_dcp_target and (
             forward_batch.forward_mode.is_decode()

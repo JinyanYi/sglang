@@ -1239,6 +1239,9 @@ class Envs:
     # valid only together with the split-query ABI and is validated at use.
     SGLANG_NPU_A5_C8_SPLIT_QUERY = EnvBool(False)
     SGLANG_NPU_A5_C8_FUSED_RING_TAIL = EnvBool(False)
+    # Diagnostic-only counters/readbacks; leave disabled for performance runs.
+    SGLANG_NPU_A5_C8_RECORD_HITS = EnvBool(False)
+    SGLANG_NPU_A5_C8_HIT_REPORT_INTERVAL = EnvInt(32)
     # Store packed C8 host rows in MemFabric SHARED memory on an A5 decode
     # worker. Keep this independent from the generic split-KV switch because
     # prefill owns native transferable pages while decode owns packed C8 rows.

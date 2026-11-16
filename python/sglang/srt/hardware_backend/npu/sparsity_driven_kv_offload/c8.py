@@ -37,6 +37,18 @@ class C8Cache:
         self.operator = load_quant_copy_sfa_operator()
         self.split_query = envs.SGLANG_NPU_A5_C8_SPLIT_QUERY.get()
         self.fused_ring_tail = envs.SGLANG_NPU_A5_C8_FUSED_RING_TAIL.get()
+        self.hit_recorder = None
+        if envs.SGLANG_NPU_A5_C8_RECORD_HITS.get():
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.c8_stats import (
+                C8HitRateRecorder,
+            )
+
+            self.hit_recorder = C8HitRateRecorder(
+                manager,
+                interval=envs.SGLANG_NPU_A5_C8_HIT_REPORT_INTERVAL.get(),
+                split_query=self.split_query,
+                fused_ring_tail=self.fused_ring_tail,
+            )
         self.operator_v2 = None
         if self.fused_ring_tail and not self.split_query:
             raise ValueError(
@@ -92,6 +104,8 @@ class C8Cache:
         manager.lim_adapter.copy_sfa_metadata(manager, plan)
         heads = layer.tp_q_head_num
         layer_index = layer.layer_id - manager.start_layer
+        if self.hit_recorder is not None:
+            self.hit_recorder.record(layer_index, plan)
         output = manager.mtp_attn_out[:rows]
         arguments = (
             manager.device_kv_buffer[layer_index].view(-1, 128, 1, 656),

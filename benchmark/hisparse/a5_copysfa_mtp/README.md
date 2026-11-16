@@ -253,3 +253,36 @@ For measured serving comparisons against the same SGLang version without
 offload, use [`41_launch_no_offload.sh`](NO_OFFLOAD.md). Table 7's BS7 reference
 uses graph bucket 8 with seven real requests per DP; a BS16 same-concurrency
 test is also supported. `50_perf.sh` remains the primary performance result.
+
+### A5 C-pool hit diagnostics
+
+The paired kernel wheel provides graph-replayed metadata counters. Enable them
+only for a separate diagnostic run:
+
+```bash
+export SGLANG_NPU_A5_C8_RECORD_HITS=1
+export SGLANG_NPU_A5_C8_HIT_REPORT_INTERVAL=32
+```
+
+Search the worker log for `A5_C8_CACHE_STATS`. The reporting interval counts
+out-of-graph attention metadata preparations, not generated tokens. The report
+contains per-layer and weighted total `prefix_hit_rate`, `tail_selected`,
+`union_misses`, `max_union_misses`, union-miss histogram bins, and
+`fallback_call_fraction`. Prefix hits use only causal selections before the
+ring-tail boundary; resident tail selections do not inflate the C-pool rate.
+They are unrelated to the request prefix-cache hit rate.
+
+`requests_gt512` counts individual requests exceeding the native threshold;
+`fallback_calls` counts complete CopySFA launches containing at least one such
+request. One request over512 switches the entire launch to union copy. IndexShare
+reuse is counted when each attention layer consumes the plan, not as another LIM
+launch. Graph-capture/warmup counts are discarded before the replay window.
+
+The counters add one diagnostic kernel per CopySFA call. Reporting synchronizes
+and reads back a small counter buffer outside graph capture. Keep this switch
+off for operator/serving latency comparisons. With it off, the framework neither
+allocates the counters nor launches their kernel.
+
+The three-arm native/pre/post operator benchmark lives in the paired kernel
+repository at `benchmark/copysfa_a5_ab/README.md`. Its device is selected with
+`--device 0`; it does not require a device-visibility environment variable.
