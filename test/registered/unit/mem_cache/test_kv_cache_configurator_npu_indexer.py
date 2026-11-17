@@ -13,6 +13,70 @@ register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 
 
 class TestNPUIndexerLayerLayout(CustomTestCase):
+    def test_pd_compaction_requires_pp1_dcp1_target(self):
+        memory = SimpleNamespace(
+            enable_hierarchical_cache=False,
+            enable_hisparse=False,
+            enable_unified_cache_external_linker=False,
+        )
+        for role in ("prefill", "decode"):
+            for pp_size, dcp_size, draft, expected in (
+                (1, 1, False, True),
+                (2, 1, False, False),
+                (1, 2, False, False),
+                (2, 2, False, False),
+                (1, 1, True, False),
+            ):
+                with (
+                    self.subTest(role=role, pp=pp_size, dcp=dcp_size, draft=draft),
+                    patch.object(kcc, "_is_npu", True),
+                    patch.object(kcc, "get_memory", return_value=memory),
+                    patch.object(
+                        kcc,
+                        "get_disagg",
+                        return_value=SimpleNamespace(disaggregation_mode=role),
+                    ),
+                    patch.object(
+                        kcc,
+                        "get_parallel",
+                        return_value=SimpleNamespace(
+                            pp_size=pp_size, attn_dcp_size=dcp_size
+                        ),
+                    ),
+                ):
+                    self.assertEqual(
+                        kcc._should_elide_dsa_index_k(is_draft_worker=draft), expected
+                    )
+
+    def test_pd_compaction_preserves_cache_compatibility_exclusions(self):
+        for excluded in (
+            "enable_hierarchical_cache",
+            "enable_hisparse",
+            "enable_unified_cache_external_linker",
+        ):
+            memory = SimpleNamespace(
+                enable_hierarchical_cache=False,
+                enable_hisparse=False,
+                enable_unified_cache_external_linker=False,
+            )
+            setattr(memory, excluded, True)
+            with (
+                self.subTest(excluded=excluded),
+                patch.object(kcc, "_is_npu", True),
+                patch.object(kcc, "get_memory", return_value=memory),
+                patch.object(
+                    kcc,
+                    "get_disagg",
+                    return_value=SimpleNamespace(disaggregation_mode="decode"),
+                ),
+                patch.object(
+                    kcc,
+                    "get_parallel",
+                    return_value=SimpleNamespace(pp_size=1, attn_dcp_size=1),
+                ),
+            ):
+                self.assertFalse(kcc._should_elide_dsa_index_k(is_draft_worker=False))
+
     def test_non_arch35_dsa_pool_uses_only_active_indexer_layers(self):
         """Shared layers must not consume indexer slots on non-arch35 NPU."""
         configurator = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
