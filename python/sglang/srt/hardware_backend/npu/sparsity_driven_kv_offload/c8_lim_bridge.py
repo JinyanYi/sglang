@@ -286,7 +286,7 @@ class C8LIMBridge:
             offsets = manager.hbm_page_offsets[None]
             cp = self.capacity // 128
             pages = manager.device_kv_stride // 128
-            physical = plan.request_slots[:, None] * pages + torch.where(
+            physical = (plan.request_slots[:, None] - 1) * pages + torch.where(
                 offsets < cp,
                 offsets,
                 cp + (plan.prefix_lens[:, None] // 128 + offsets - cp) % 2,
@@ -318,4 +318,5 @@ class C8LIMBridge:
             host_block_table=self.block_table[:batch],
             packed_c8=True,
             prefix_lens=plan.prefix_lens,
+            hbm_request_offset=1,
         )

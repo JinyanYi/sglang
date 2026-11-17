@@ -294,6 +294,7 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
                     workspace=self.tail_workspace,
                     capacity=self.cache_capacity,
                     context_len=self.logical_max_context_len,
+                    hbm_request_offset=1,
                     query_width=4
                     if forward_batch.forward_mode.is_target_verify()
                     else 1,
