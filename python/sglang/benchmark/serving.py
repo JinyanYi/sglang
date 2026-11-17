@@ -117,6 +117,10 @@ class RequestFuncOutput:
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
     spec_accept_length: float = 0.0
+    spec_verify_ct: Optional[int] = None
+    spec_num_correct_drafts: Optional[int] = None
+    spec_num_proposed_drafts: Optional[int] = None
+    spec_completion_tokens: Optional[int] = None
     spec_cap_length: float = 0.0
     spec_block_accept_length: float = 0.0
     spec_cap_lens_histogram: List[int] = field(default_factory=list)
@@ -689,6 +693,44 @@ async def async_request_truss(
     return output
 
 
+def _record_spec_counts(meta_info: Dict[str, Any], output: RequestFuncOutput) -> None:
+    keys = (
+        "spec_verify_ct",
+        "spec_num_correct_drafts",
+        "spec_num_proposed_drafts",
+        "completion_tokens",
+    )
+    values = [meta_info.get(key) for key in keys]
+    if not all(isinstance(value, int) and value >= 0 for value in values):
+        return
+    verify_ct, correct, proposed, completion = values
+    if verify_ct == 0 or proposed == 0 or correct > proposed:
+        return
+    output.spec_verify_ct = verify_ct
+    output.spec_num_correct_drafts = correct
+    output.spec_num_proposed_drafts = proposed
+    output.spec_completion_tokens = completion
+
+
+def _summarize_spec_counts(outputs: List[RequestFuncOutput]) -> Dict[str, Any]:
+    successful = [output for output in outputs if output.success]
+    valid = [output for output in successful if output.spec_verify_ct is not None]
+    verify = sum(output.spec_verify_ct for output in valid)
+    proposed = sum(output.spec_num_proposed_drafts for output in valid)
+    correct = sum(output.spec_num_correct_drafts for output in valid)
+    completion = sum(output.spec_completion_tokens for output in valid)
+    return {
+        "successful_requests": len(successful),
+        "requests_with_counts": len(valid),
+        "verify_ct": verify,
+        "correct_drafts": correct,
+        "proposed_drafts": proposed,
+        "completion_tokens": completion,
+        "accept_length": completion / verify if verify else None,
+        "accept_rate": correct / proposed if proposed else None,
+    }
+
+
 async def async_request_sglang_generate(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
@@ -764,6 +806,7 @@ async def async_request_sglang_generate(
                                 output.spec_accept_length = _meta_info[
                                     "spec_accept_length"
                                 ]
+                            _record_spec_counts(_meta_info, output)
 
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
@@ -1746,6 +1789,26 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
+    spec_summary = _summarize_spec_counts(outputs)
+    if spec_summary["requests_with_counts"]:
+        print(
+            "Speculative stats coverage:               "
+            f"{spec_summary['requests_with_counts']}/{spec_summary['successful_requests']} successful requests"
+        )
+        if spec_summary["requests_with_counts"] != spec_summary["successful_requests"]:
+            print("WARNING: Speculative stats cover only a subset of successful requests.")
+        print(
+            "{:<40} {:.4f}".format(
+                "Bench accept length:", spec_summary["accept_length"]
+            )
+        )
+        print(
+            "{:<40} {:.2%}".format(
+                "Bench accept rate:", spec_summary["accept_rate"]
+            )
+        )
+    elif "sglang" in backend:
+        print("Bench speculative stats: unavailable (no per-request counts returned)")
     if goodput:
         print_goodput(goodput)
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
@@ -1903,6 +1966,7 @@ async def benchmark(
             "p99_itl_ms": metrics.p99_itl_ms,
             "concurrency": metrics.concurrency,
             "accept_length": accept_length,
+            "bench_speculative": spec_summary,
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
@@ -1956,6 +2020,16 @@ async def benchmark(
         result_details["cached_tokens_details"] = [
             o.cached_tokens_details for o in outputs
         ]
+
+    result_details["speculative_counts"] = [
+        {
+            "verify_ct": o.spec_verify_ct,
+            "correct_drafts": o.spec_num_correct_drafts,
+            "proposed_drafts": o.spec_num_proposed_drafts,
+            "completion_tokens": o.spec_completion_tokens,
+        }
+        for o in outputs
+    ]
 
     # Append results to a JSONL file
     with open(output_file_name, "a") as file:
