@@ -35,9 +35,9 @@ class C8BudgetPlan:
         compute_dtype=torch.bfloat16,
         mf_shared=False,
     ):
-        if request_rows <= 0 or num_layers <= 0 or not 0 < context_len <= 262144:
+        if request_rows <= 1 or num_layers <= 0 or not 0 < context_len <= 262144:
             raise ValueError(
-                "A5 C8 requires positive rows/layers and context <=262144."
+                "A5 C8 requires a live request row, positive layers and context <=262144."
             )
         if top_k != 2048 or max_query_width not in (1, 4):
             raise ValueError("A5 ring-tail integration supports K2048 and Q1/Q4.")
@@ -50,6 +50,8 @@ class C8BudgetPlan:
         if compute_dtype not in (torch.bfloat16, torch.float16):
             raise ValueError("A5 CopySFA compute must use BF16/FP16.")
         self.request_rows = request_rows
+        # Request IDs retain the framework's null row, but payload storage does not.
+        self.kv_request_rows = request_rows - 1
         self.context_len = (context_len + 127) // 128 * 128
         self.num_layers = num_layers
         self.top_k = top_k
@@ -67,7 +69,7 @@ class C8BudgetPlan:
         # Q1/Q4 captures. Only one attention layer uses the shared workspaces.
         self.manager_buffers = {
             "device_kv_buffer": BufferSpec(
-                (r, c + 256, 1, 656), torch.int8, num_layers
+                (self.kv_request_rows, c + 256, 1, 656), torch.int8, num_layers
             ),
             "device_slot_map": BufferSpec(
                 (r + 1, self.context_len), torch.int32, num_layers

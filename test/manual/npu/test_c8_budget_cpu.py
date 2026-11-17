@@ -69,10 +69,25 @@ def test_actual_declared_allocation_bytes(budget, query_width):
     tensors.append(p.query_spec.allocate("cpu"))
     tensors.extend(torch.arange(5, dtype=torch.int32) for _ in range(4))
     assert p.managed_hbm_bytes == sum(x.numel() * x.element_size() for x in tensors)
-    assert p.manager_buffers["device_kv_buffer"].shape == (3, 8192 + 256, 1, 656)
+    assert p.manager_buffers["device_kv_buffer"].shape == (2, 8192 + 256, 1, 656)
     assert p.batch_capacity == 5 and p.request_rows == 3
     assert p.context_len == 8704
     assert not p.prefill_workspace_bytes
+
+
+@pytest.mark.parametrize("batch_size", [1, 3, 4])
+@pytest.mark.parametrize("extra_slots", [0, 2])
+def test_null_request_reserves_metadata_but_no_kv_payload(
+    budget, batch_size, extra_slots
+):
+    live_rows = batch_size + extra_slots
+    p = plan(budget, request_rows=live_rows + 1)
+    payload = p.manager_buffers["device_kv_buffer"]
+    assert p.kv_request_rows == live_rows
+    assert payload.nbytes == live_rows * (8192 + 256) * 656 * 2
+    # Keep the null request and LIM's invalid-request sentinel in metadata only.
+    assert p.manager_buffers["device_slot_map"].shape[0] == live_rows + 2
+    assert p.manager_buffers["tail_starts"].shape == (live_rows + 2,)
 
 
 @pytest.mark.parametrize("width", [2, 3, 5, 14])
