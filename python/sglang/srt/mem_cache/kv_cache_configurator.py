@@ -136,10 +136,12 @@ logger = logging.getLogger(__name__)
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     """Shared-topk layers get a 0-row index-K buffer; HiCache and PD must skip those entries."""
     memory_config = get_memory()
-    # Ascend PD slices the KV list positionally (index-K rides in it, not in
-    # StateType.DSA), so a compact layout would mis-slice PP>1 against PP=1.
+    # Ascend PP slicing assumes one index-K entry per model layer. PP=1,
+    # DCP=1 peers can transfer the same compact owner list without slicing.
     if _is_npu and get_disagg().disaggregation_mode != "null":
-        return False
+        parallel = get_parallel()
+        if parallel.pp_size != 1 or parallel.attn_dcp_size != 1:
+            return False
     # The NPU HiCache host pool has no compact index-K layout.
     if _is_npu and memory_config.enable_hierarchical_cache:
         return False
